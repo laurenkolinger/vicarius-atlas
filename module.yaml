@@ -1,0 +1,104 @@
+# ==============================================================================
+# MODULE INTERFACE DEFINITION - TCRMP 3D Atlas
+# ==============================================================================
+# v2.0.0 rewrite (2026-08-27). The atlas is no longer a rebuild-by-hand static
+# viewer served on its own port; it is a native page of vicarius_ui_os itself
+# (the Flask blueprint atlas_views.py, registered in vicarius_ui_os/app.py),
+# reading and writing the platform TCRMP 3D registry
+# (vicarius/_METADATA/3d/registry.py) on every request. It shows a live,
+# editable view of every TCRMP transect timepoint: identity, per-step status,
+# scale, locations, sizes, and a console tail for whatever is running right
+# now. There is no build step and no separate port; the page IS the current
+# state of the registry.
+#
+# ui.style: atlas (below) tells module_views.py to route this module's tile
+# straight at the atlas pane: /modules/tcrmp_3d_atlas renders /atlas, and
+# /modules/tcrmp_3d_atlas/fragment returns the identical JSON payload
+# /atlas/fragment does (module_views.module_fragment_view calls
+# atlas_views._fragment_payload() directly), so the desktop icon opens the
+# atlas through the SAME embedded-pane mechanism every other module tile
+# uses (kind: "fragment" in desktop_boot.js), not a launched external viewer.
+#
+# There is deliberately no cli block: this module has no standalone script of
+# its own to run. It is a page inside the already-running vicarius_ui_os
+# process (port 5090), so there is nothing to launch and nothing to POST a
+# launch for. The v1 viewer that WAS launched this way (a detached
+# `python3 -m http.server` on port 8765 via serve.sh) is retired; see
+# legacy/README.md.
+#
+# Like vicarlab / benthic_species_viewer / vicar_slideshow, this is a
+# resource module: it produces no dictionary-bound dataset of its own, so
+# there is deliberately NO outputs/EML contract here. The registry it reads
+# and writes is a shared platform contract owned by
+# vicarius/_METADATA/3d/registry.py, not a dataset this module alone
+# produces; see docs.registry_contract below for its schema.
+# ==============================================================================
+
+name: "tcrmp_3d_atlas"
+display_name: "TCRMP 3D Atlas"          # short human title on the UI card; REQUIRED
+tags: ["TCRMP", "3D"]                    # filter chips; REQUIRED
+hidden: false
+hidden_reason: ""
+version: "2.0.0"
+description: "Live, editable view of every TCRMP 3D transect timepoint in the platform registry: identity, ingest facts, step 1 progress and scale, manual-edit and step 2 status, locations and sizes, a console tail for whatever is running, and a Ready-for-manual-editing notice board. Reads and writes vicarius/_METADATA/3d/registry.py on every request; edits (season token, readable id, process, notes, locations) are logged to the registry event log and never clobbered by a rerun of ingest."
+author: "Lauren K Olinger"
+created: "2026-06-24"
+
+# Classification: status/edit dashboard over a shared platform registry, not a
+# data pipeline stage.
+type: "resource"
+
+# ------------------------------------------------------------------------------
+# INPUTS
+# ------------------------------------------------------------------------------
+# The atlas both reads and writes this one contract; there is no separate
+# "outputs" side because the registry is not a dataset this module alone
+# produces (3D_phase_1, the ingest scripts, and the future sync driver all
+# write to it too through the same locked, atomic-replace library).
+inputs:
+  - name: "tcrmp_3d_registry"
+    type: "directory"
+    formats: [".csv", ".yaml"]
+    location: "vicarius/_METADATA/3d/ (tcrmp_3d_registry.csv, events.csv, snapshots/)"
+    required: true
+    description: "The platform TCRMP 3D registry: tcrmp_3d_registry.csv (one row per transect timepoint), events.csv (append-only edit log), and snapshots/<readable_id>/ (point-in-time captures for timepoints no longer on disk). The atlas reads it on every request (GET /atlas/api/rows, /api/detail, /api/console, /api/report) and writes operator-edited cells through POST /atlas/api/edit; every read and write goes through vicarius/_METADATA/3d/registry.py, which holds an exclusive file lock and replaces the CSV atomically so a concurrent module write can never be torn. Never read or written directly by this module outside that library."
+
+# ------------------------------------------------------------------------------
+# OUTPUTS - no data-dictionary contract
+# ------------------------------------------------------------------------------
+# No catalogued dataset and no EML sidecar, same precedent as vicarlab /
+# benthic_species_viewer / vicar_slideshow: this module edits a shared
+# platform contract (see docs.registry_contract) rather than producing its
+# own dataset.
+outputs: []
+
+runtime:
+  python_version: ">=3.10"     # runs inside the vicarius_ui_os process, not its own interpreter
+  gpu_required: false
+  external_software: "A web browser. Runs inside the already-serving vicarius_ui_os desktop (port 5090); no separate process, port, or launch."
+  dependencies: "vicarius_ui_os's own Flask app, plus the shared library at vicarius/_METADATA/3d (registry.py, naming3d.py) on sys.path. No install of its own."
+  tested_os: "Ubuntu 22.04"
+  estimated_time: "live view; rows refresh every 15s, the active console tail every 5s, nothing to wait on"
+
+# ------------------------------------------------------------------------------
+# VICARIUS UI - atlas style
+# ------------------------------------------------------------------------------
+# style: atlas tells module_views.py to treat this module's page and fragment
+# routes as pass-throughs to the atlas_views.py blueprint instead of
+# rendering the generic runner form or the launcher page: module_detail_view
+# redirects /modules/tcrmp_3d_atlas to /atlas, and module_fragment_view
+# returns atlas_views._fragment_payload() for /modules/tcrmp_3d_atlas/fragment
+# (identical to what /atlas/fragment itself returns, lock state included).
+ui:
+  style: "atlas"   # embed the native atlas pane; see module_views.py's "atlas" branches
+
+# ------------------------------------------------------------------------------
+# Documentation links
+# ------------------------------------------------------------------------------
+# Not a schema field the platform parses; kept here so an operator opening
+# this file finds every related doc without hunting.
+docs:
+  readme: "README.md"                                    # what the atlas shows, editing rules, the live panel, the notices
+  ingest_procedure: "atlasprep.md"                        # preparing a raw video folder before ingest: merging parts, normalizing names
+  ingest_script: "atlasingest.py"                         # `python3 atlasingest.py <folder> [--dry-run]`, writes registry rows
+  registry_contract: "../../../_METADATA/3d/README.md"    # the platform TCRMP 3D registry: columns, operator-edited cells, the lock + event log
