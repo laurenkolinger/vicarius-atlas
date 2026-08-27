@@ -52,7 +52,12 @@ for you. It happens before a timepoint ever shows up here.
    `TCRMP{YYYYMMDD}_3D_{SITE}_{T#}.{ext}`, and (with `--apply`) carries it
    out, merging parts with `ffmpeg`'s concat demuxer and logging every action
    to `prep_log.csv`. Dry run by default: `python3 prep_tools.py <folder>`;
-   carry it out with `python3 prep_tools.py <folder> --apply`.
+   carry it out with `python3 prep_tools.py <folder> --apply`. A merge deletes
+   its source parts only after the merged duration is checked against the sum
+   of the parts' durations, to within the larger of half a second and two
+   percent: a mismatch keeps every part and logs the row as
+   `merge unverified` with both numbers, because these recordings cannot be
+   re-shot. `--keep-parts` turns the deletion off entirely.
 2. **Ingest** (`atlasingest.py`) - once a folder holds one standard-named
    video per timepoint, `python3 atlasingest.py <folder> [--dry-run]` runs
    `ffprobe` on each file, derives the readable id and season token from the
@@ -62,7 +67,10 @@ for you. It happens before a timepoint ever shows up here.
    video currently sits: `video_location` is refreshed on every run even for
    an existing row, but identity cells an operator has already hand-corrected
    (season token, readable id, process, notes) are left alone
-   (`protect_operator=True`).
+   (`protect_operator=True`). A row whose readable id was corrected in the
+   atlas after an earlier ingest is found again by its `original_videos` file
+   name rather than by the id recomputed from that name, so re-ingesting the
+   folder updates that row instead of resurrecting the old id as a duplicate.
 
 After ingest, the script prints a reminder to open the atlas and review each
 new row before the timepoint is processed: check the readable id and season
@@ -77,14 +85,24 @@ Only the cells `registry.OPERATOR_COLUMNS` names are editable here:
 module (`3D_phase_1`, later step 2) or by ingest, and the table shows those
 as read-only text.
 
-- `season_token` is a select (`_pbl` / `ann`); `process` is a checkbox;
-  `video_location`, `processing_location`, `output_location`, and `notes` are
-  inline text fields that save on change or Enter.
+- `season_token` is a select (`_pbl` / `ann`), and changing it is a rename,
+  not a cell edit. The token is part of the readable id, and every consumer
+  reads it back out of the id (sort order, the processing folder name, the
+  psx range, the chunk label), so the API recomputes the id from the row's
+  site, transect and year plus the new token and calls `registry.rename_id`.
+  The confirm dialog names the new id first. Picking the token the row
+  already carries is refused with a 400, a token that yields a malformed id
+  with a 400, and a collision with an existing id with a 409.
+- `process` is a checkbox; `video_location`, `processing_location`,
+  `output_location`, and `notes` are inline text fields that save on change
+  or Enter.
 - `readable_id` has a RENAME control: type the new id and confirm. Renaming
   moves the registry row, its event history, and its snapshot directory to
   the new id, but does **not** rename anything already written to disk under
   the old id - folders, the psx, frame directories keep their existing
-  names. A rename to a malformed id (wrong `{SITE}_{T#}_{year}{token}`
+  names. The frames folder in particular keeps its old name, and step 1 looks
+  for frames under the new id, so rename that folder by hand before
+  reprocessing a renamed timepoint. A rename to a malformed id (wrong `{SITE}_{T#}_{year}{token}`
   shape) is refused with a 400 before it reaches the registry; a rename to an
   id that already exists is refused with a 409.
 - Every edit posts `{readable_id, field, value, initials}` to
@@ -97,6 +115,25 @@ as read-only text.
   every programmatic writer that expects to run repeatedly passes
   `protect_operator=True`, which skips an `OPERATOR_COLUMNS` cell once it
   already holds a non-empty value.
+
+### Known property: location cells are read back verbatim
+
+`processing_location`, `output_location` and `video_location` are
+operator-editable, and the detail routes read whatever path they hold: the
+drawer reads that folder's `analysis_params.yaml` and `status.csv`, tails its
+console logs and lists its contents, and `/atlas/api/report` serves a PDF
+found under it. So anyone who can reach the atlas can point those routes at
+any directory on this machine and read it back through the browser. Nothing
+there writes, deletes or moves a file.
+
+That is acceptable for the deployment this module has today: one operator, a
+UI bound to this box on port 5090, the module lock-gated, and a person who can
+already read their own files from a shell. It stops being acceptable the
+moment the UI is reachable by a second person or from another machine. The
+fix at that point is a `realpath` containment check against a configured list
+of allowed roots, applied in `_live_detail`, `api_console` and `api_report`
+in `vicarius_ui_os/atlas_views.py`. `snapshot_dir` has the same shape but is
+not operator-editable, so reaching it needs a spreadsheet edit.
 
 ## The live panel
 

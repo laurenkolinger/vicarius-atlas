@@ -154,6 +154,80 @@ class AtlasIngestTests(unittest.TestCase):
         created_ids = sorted(r["readable_id"] for r in results if r["status"] == "created")
         self.assertEqual(created_ids, ["MRS_T1_2023ann", "MRS_T1_2024_pbl", "MRS_T1_2024ann", "MRS_T1_2025_pbl"])
 
+    def test_a_probe_that_reports_na_is_skipped_not_raised(self):
+        # ffprobe reports "N/A" for size or duration on some containers, so
+        # probe()'s int()/float() raise a plain ValueError. json.JSONDecodeError
+        # is a subclass and does not catch the parent, so one odd file used to
+        # abort the whole folder.
+        real_probe = atlasingest.probe
+        target = "TCRMP20231015_3D_MRS_T1.MOV"
+
+        def na_probe(path):
+            if os.path.basename(path) == target:
+                raise ValueError("invalid literal for int() with base 10: 'N/A'")
+            return real_probe(path)
+
+        atlasingest.probe = na_probe
+        try:
+            results = atlasingest.ingest_folder(self.d, actor="test")
+        finally:
+            atlasingest.probe = real_probe
+
+        bad = next(r for r in results if r["file"] == target)
+        self.assertEqual(bad["status"], "skipped")
+        self.assertTrue(bad["reason"].startswith("ffprobe failed:"))
+        created = sorted(r["readable_id"] for r in results if r["status"] == "created")
+        self.assertEqual(created, ["MRS_T1_2024_pbl", "MRS_T1_2024ann", "MRS_T1_2025_pbl"])
+
+    # --- rerun after a readable_id rename (final review I8) ---------------
+
+    def test_rerun_after_a_rename_updates_the_row_rather_than_duplicating_it(self):
+        atlasingest.ingest_folder(self.d, actor="test")
+        self.assertIsNotNone(self.r.get("MRS_T1_2023ann"))
+
+        # The review step the spec asks for: the season was derived wrong, so
+        # the operator renames the row in the atlas.
+        self.r.rename_id("MRS_T1_2023ann", "MRS_T1_2023_pbl", actor="atlas:LO")
+
+        results = atlasingest.ingest_folder(self.d, actor="test")
+        row = next(r for r in results if r["file"] == "TCRMP20231015_3D_MRS_T1.MOV")
+        self.assertEqual(row["status"], "updated")
+        self.assertEqual(row["readable_id"], "MRS_T1_2023_pbl")
+
+        self.assertIsNone(self.r.get("MRS_T1_2023ann"),
+                          "the old id must not come back as a second row")
+        ids = [r["readable_id"] for r in self.r.load()]
+        self.assertEqual(ids.count("MRS_T1_2023_pbl"), 1)
+        self.assertEqual(len([i for i in ids if i.startswith("MRS_T1_2023")]), 1)
+
+    def test_rename_target_keeps_its_identity_cells_on_rerun(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(folder, ignore_errors=True))
+        tiny(os.path.join(folder, "TCRMP20231015_3D_KGC_T4.MOV"), "libx264")
+
+        atlasingest.ingest_folder(folder, actor="test")
+        self.r.rename_id("KGC_T4_2023ann", "KGC_T4_2022_pbl", actor="atlas:LO")
+
+        atlasingest.ingest_folder(folder, actor="test")
+        row = self.r.get("KGC_T4_2022_pbl")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["year"], "2022")
+        self.assertEqual(row["season_token"], "_pbl")
+        self.assertIsNone(self.r.get("KGC_T4_2023ann"))
+        # The ffprobe facts and the location still refresh.
+        self.assertEqual(row["video_location"], folder)
+        self.assertEqual(row["original_videos"], "TCRMP20231015_3D_KGC_T4.MOV")
+
+    def test_a_different_video_at_the_same_site_still_creates_its_own_row(self):
+        atlasingest.ingest_folder(self.d, actor="test")
+        self.r.rename_id("MRS_T1_2023ann", "MRS_T1_2023_pbl", actor="atlas:LO")
+        tiny(os.path.join(self.d, "TCRMP20261015_3D_MRS_T1.MOV"), "libx264")
+
+        results = atlasingest.ingest_folder(self.d, actor="test")
+        row = next(r for r in results if r["file"] == "TCRMP20261015_3D_MRS_T1.MOV")
+        self.assertEqual(row["status"], "created")
+        self.assertEqual(row["readable_id"], "MRS_T1_2026ann")
+
 
 if __name__ == "__main__":
     unittest.main()

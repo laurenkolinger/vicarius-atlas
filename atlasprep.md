@@ -84,8 +84,13 @@ duplicate timepoint.
    or unexpected tokens are left out of the plan; list them and ask Lauren
    rather than guessing what they should be renamed to.
 4. On her yes, run `python3 prep_tools.py <folder> --apply`, then open
-   `prep_log.csv` and confirm every row matches what was shown.
-5. Run ingest (`atlasingest.py`) only after the log is checked and every file
+   `prep_log.csv` and confirm every row matches what was shown. Every merge
+   row records the merged duration, the summed part durations, and whether
+   the parts were deleted.
+5. If any row reads `merge unverified`, stop. The parts are still on disk;
+   report the two durations to Lauren and let her decide, rather than
+   deleting anything.
+6. Run ingest (`atlasingest.py`) only after the log is checked and every file
    opens under `ffprobe`.
 
 ## Never do
@@ -93,11 +98,15 @@ duplicate timepoint.
 - Never rename individual frames or any file inside a frames/processing
   folder; `prep_tools.py` only touches raw video files at the top level of
   the season folder that match a TCRMP 3D video name.
-- Never delete the original part files before the merge is verified. Confirm
-  the merged file's duration and frame count look right before treating the
-  originals as disposable; `prep_tools.py` removes the originals itself only
-  as the last step of a successful `--apply` merge, and only after the
-  ffmpeg concat completes without error.
+- Never delete the original part files by hand. `prep_tools.py` deletes them
+  itself, as the last step of an `--apply` merge, and only once it has
+  verified the merge: it probes the merged file's duration and compares it to
+  the sum of the parts' durations, and deletes only when the two agree to
+  within the larger of half a second and two percent. A mismatch keeps every
+  part, logs the row as `merge unverified` with both numbers, and leaves the
+  merged file in place for a person to inspect. `--keep-parts` turns the
+  deletion off entirely. These are field recordings of a transect at a point
+  in time; they cannot be re-shot.
 - Never guess a survey date, site, or transect for a file that does not match
   the standard name pattern or one of the known variants above. A file
   `plan()` cannot parse is left out of the plan; ask Lauren rather than

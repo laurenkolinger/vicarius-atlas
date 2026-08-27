@@ -101,3 +101,77 @@ class OverwriteGuardTests(unittest.TestCase):
         after = open(canonical_path, "rb").read()
         self.assertEqual(before, after)
         self.assertTrue(os.path.exists(os.path.join(self.d, "TCRMP20241018_3D_MRS_T1_Proxy.MKV")))
+
+
+class MergeVerificationTests(unittest.TestCase):
+    """A merge deletes its irreplaceable source parts only once the merged
+    duration matches the sum of the parts' durations (final review I4)."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.parts = ["TCRMP20240412_3D_MRS_T1_1.MP4", "TCRMP20240412_3D_MRS_T1_2.MP4"]
+        for name in self.parts:
+            tiny(os.path.join(self.d, name), "libx264")
+        self.log = os.path.join(self.d, "prep_log.csv")
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def _rows(self):
+        return list(csv.DictReader(open(self.log)))
+
+    def test_verify_durations_rule(self):
+        ok, expected, tolerance = prep_tools.verify_durations(2.0, [1.0, 1.0])
+        self.assertTrue(ok)
+        self.assertEqual(expected, 2.0)
+        self.assertEqual(tolerance, 0.5)
+        # Half a second is the floor; two percent takes over on long recordings.
+        self.assertFalse(prep_tools.verify_durations(1.4, [1.0, 1.0])[0])
+        self.assertTrue(prep_tools.verify_durations(1990.0, [1000.0, 1000.0])[0])
+        self.assertFalse(prep_tools.verify_durations(950.0, [1000.0, 1000.0])[0])
+
+    def test_verified_merge_deletes_the_parts(self):
+        prep_tools.apply(self.d, prep_tools.plan(self.d), self.log)
+        names = os.listdir(self.d)
+        self.assertIn("TCRMP20240412_3D_MRS_T1.MP4", names)
+        for part in self.parts:
+            self.assertNotIn(part, names)
+        row = [r for r in self._rows() if r["output"] == "TCRMP20240412_3D_MRS_T1.MP4"][0]
+        self.assertEqual(row["action"], "merge")
+        self.assertIn("verified", row["reason"])
+        self.assertIn("parts deleted", row["reason"])
+
+    def test_unverified_merge_keeps_the_parts_and_says_so(self):
+        # Make the probe lie about the merged file: report half the duration
+        # the parts add up to, the shape a truncated concat has.
+        real_duration = prep_tools._duration
+        merged_name = "TCRMP20240412_3D_MRS_T1.MP4"
+
+        def lying_duration(path):
+            value = real_duration(path)
+            return value / 4 if os.path.basename(path) == merged_name else value
+
+        prep_tools._duration = lying_duration
+        try:
+            prep_tools.apply(self.d, prep_tools.plan(self.d), self.log)
+        finally:
+            prep_tools._duration = real_duration
+
+        names = os.listdir(self.d)
+        self.assertIn(merged_name, names)
+        for part in self.parts:
+            self.assertIn(part, names, "an unverified merge must keep every part")
+        row = [r for r in self._rows() if r["output"] == merged_name][0]
+        self.assertEqual(row["action"], "merge unverified")
+        self.assertIn("merged", row["reason"])
+        self.assertIn("Parts kept", row["reason"])
+
+    def test_keep_parts_never_deletes_even_when_verified(self):
+        prep_tools.apply(self.d, prep_tools.plan(self.d), self.log, keep_parts=True)
+        names = os.listdir(self.d)
+        self.assertIn("TCRMP20240412_3D_MRS_T1.MP4", names)
+        for part in self.parts:
+            self.assertIn(part, names)
+        row = [r for r in self._rows() if r["output"] == "TCRMP20240412_3D_MRS_T1.MP4"][0]
+        self.assertEqual(row["action"], "merge")
+        self.assertIn("--keep-parts", row["reason"])

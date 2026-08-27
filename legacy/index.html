@@ -297,7 +297,7 @@ footer b{color:var(--text)} footer a{color:var(--proc)}
       </div>
       <div>
         <h5>Flags &amp; chips</h5>
-        <div class="row"><span class="chip warn">⚠</span> filename date is malformed/non-standard. <b>Year &amp; season come from the project folder</b>, so grouping is unaffected — the flag just marks a name to fix upstream</div>
+        <div class="row"><span class="chip warn">flag</span> filename date is malformed/non-standard. <b>Year &amp; season come from the project folder</b>, so grouping is unaffected; the flag just marks a name to fix upstream</div>
         <div class="row"><span class="chip proxy">proxy / px</span> proxy encoding copy (e.g. iOS H.264 alongside ProRes)</div>
         <div class="row"><span class="pchip has PROCESSED">period</span> surveyed that period (color = furthest stage) &nbsp; <span class="pchip miss">period</span> gap — not surveyed</div>
         <div class="row"><b>VIC-D0xx</b> NAS archive drive UID · <b>Hot/Cold</b> = online / shelved at snapshot time</div>
@@ -369,7 +369,7 @@ function modelNode(m){
   const chips=[`<span class="chip">${esc(m.site)}·${esc(m.transect)}</span>`];
   if(m.multipart) chips.push(`<span class="chip">part ${esc(m.multipart)}</span>`);
   if(m.proxy) chips.push(`<span class="chip proxy">proxy</span>`);
-  if(m.anomaly) chips.push(`<span class="chip warn" title="${esc(m.anomaly)}">⚠ ${esc(m.anomaly)}</span>`);
+  if(m.anomaly) chips.push(`<span class="chip warn" title="${esc(m.anomaly)}">${esc(m.anomaly)}</span>`);
   const cams=(m.aligned||m.total_cams)?`${esc(m.aligned||'?')}/${esc(m.total_cams||'?')} cam`:'';
   d.innerHTML=`<summary><span class="idwrap">
       <div class="mid"><span class="caret"></span>${esc(m.model_id)}</div>
@@ -453,7 +453,7 @@ function thead(){
 }
 function modelRow(m){
   const cams=(m.aligned||m.total_cams)?`${esc(m.aligned||'?')}/${esc(m.total_cams||'?')}`:'';
-  const warn=m.anomaly?` <span class="warnflag" title="${esc(m.anomaly)}">⚠</span>`:'';
+  const warn=m.anomaly?` <span class="warnflag" title="${esc(m.anomaly)}">!</span>`:'';
   return `<tr class="mrow" data-stage="${esc(m.stage)}" data-search="${esc((m.model_id+' '+m.site+' '+m.transect).toLowerCase())}">
     <td class="midcell">${esc(m.model_id)}${warn}</td>
     <td>${esc(m.site)}</td><td>${esc(m.transect)}${m.proxy?' <span class="loc a">px</span>':''}</td>

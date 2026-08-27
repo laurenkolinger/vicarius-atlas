@@ -9,6 +9,13 @@ that already exists. `apply()` carries that plan out: merging with ffmpeg
 (stream copy, no re-encode) and renaming with `os.rename`, and logs every
 action to `prep_log.csv`. `apply()` never overwrites an existing output file.
 
+A merge deletes its source parts only after the merged file is verified: the
+merged duration must match the sum of the parts' durations to within the
+larger of half a second and two percent. These are field recordings of a
+transect at a point in time and cannot be re-shot, so a mismatch keeps every
+part, logs the action as "merge unverified" with both numbers, and leaves the
+merged file in place for a person to look at. `--keep-parts` never deletes.
+
 See `atlasprep.md` in this same folder for the operator/agent procedure.
 """
 import argparse
@@ -126,7 +133,44 @@ def _codec_name(path):
     return streams[0]["codec_name"]
 
 
-def _merge(folder, inputs, output):
+def _duration(path):
+    """Duration of `path` in seconds, from the container header."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+        check=True, capture_output=True, text=True,
+    )
+    value = (json.loads(out.stdout).get("format") or {}).get("duration")
+    if value in (None, "", "N/A"):
+        raise RuntimeError(f"ffprobe reported no duration for {path}")
+    return float(value)
+
+
+# How far the merged duration may sit from the sum of the parts before the
+# merge counts as unverified. A stream copy concat is exact to within container
+# rounding, so this is generous; it exists so a rounding difference on a long
+# recording does not read as a truncated file.
+MERGE_TOLERANCE_S = 0.5
+MERGE_TOLERANCE_FRACTION = 0.02
+
+
+def verify_durations(merged_s, part_durations):
+    """(ok, expected_s, tolerance_s) for a merged file against its parts.
+
+    The merged duration has to match the sum of the parts to within the larger
+    of MERGE_TOLERANCE_S and MERGE_TOLERANCE_FRACTION of that sum. Pure, so the
+    rule can be tested without ffmpeg.
+    """
+    expected = sum(part_durations)
+    tolerance = max(MERGE_TOLERANCE_S, MERGE_TOLERANCE_FRACTION * expected)
+    return abs(merged_s - expected) <= tolerance, expected, tolerance
+
+
+def _merge(folder, inputs, output, keep_parts=False):
+    """Concat `inputs` into `output`, then delete the parts only if the merge
+    verified. Returns a dict describing what happened:
+    {"verified": bool, "merged_s": float, "parts_s": float, "tolerance_s":
+    float, "deleted": bool}.
+    """
     paths = [os.path.join(folder, name) for name in inputs]
     codecs = {name: _codec_name(path) for name, path in zip(inputs, paths)}
     distinct = set(codecs.values())
@@ -137,22 +181,42 @@ def _merge(folder, inputs, output):
             f"codec before merging {', '.join(inputs)}"
         )
 
+    part_durations = [_duration(path) for path in paths]
+
     output_path = os.path.join(folder, output)
     with tempfile.TemporaryDirectory() as tmpdir:
         list_path = os.path.join(tmpdir, "list.txt")
         with open(list_path, "w") as fh:
             for path in paths:
+                # Single-quoted with -safe 0. Safe because plan() only admits
+                # names matching naming3d.VIDEO_NAME, which is alphanumerics
+                # and underscores: no name reaching here can hold a quote to
+                # break out with. Loosening that regex means quoting these
+                # paths properly first.
                 fh.write(f"file '{os.path.abspath(path)}'\n")
         subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0",
              "-i", list_path, "-c", "copy", output_path],
             check=True,
         )
-    for name, path in zip(inputs, paths):
-        os.remove(path)
+
+    # ffmpeg's exit code says the command ran, not that the output holds every
+    # frame that went in: a corrupt tail in one part can be recovered from with
+    # a warning and a short file. The parts are irreplaceable field recordings,
+    # so nothing is deleted until the durations agree.
+    merged_s = _duration(output_path)
+    ok, expected, tolerance = verify_durations(merged_s, part_durations)
+
+    deleted = False
+    if ok and not keep_parts:
+        for path in paths:
+            os.remove(path)
+        deleted = True
+    return {"verified": ok, "merged_s": round(merged_s, 2), "parts_s": round(expected, 2),
+            "tolerance_s": round(tolerance, 2), "deleted": deleted}
 
 
-def apply(folder, actions, log_path):
+def apply(folder, actions, log_path, keep_parts=False):
     """Carry out `actions` (as returned by `plan`) inside `folder`.
 
     Merges are done with the ffmpeg concat demuxer and `-c copy`; renames use
@@ -163,6 +227,12 @@ def apply(folder, actions, log_path):
     backstop for any output collision `plan()` did not already flag as a
     conflict. Every non-"keep" action appends one row to `log_path` (created
     with a header if it does not already exist).
+
+    A merge's source parts are deleted only after the merged duration is
+    checked against the sum of the parts' durations. When they disagree the
+    parts stay on disk and the row is logged with action "merge unverified"
+    and both numbers in its reason, so the operator can compare the two files
+    themselves. `keep_parts=True` never deletes, verified or not.
     """
     is_new_log = not os.path.exists(log_path)
     with open(log_path, "a", newline="") as log_fh:
@@ -176,6 +246,7 @@ def apply(folder, actions, log_path):
                 continue
 
             output_path = os.path.join(folder, action["output"])
+            logged_action, logged_reason = kind, action["reason"]
 
             if kind == "conflict":
                 print(f"conflict: {', '.join(action['inputs'])} -> {action['output']} ({action['reason']})")
@@ -186,7 +257,24 @@ def apply(folder, actions, log_path):
                     )
                 print(f"{kind}: {', '.join(action['inputs'])} -> {action['output']}")
                 if kind == "merge":
-                    _merge(folder, action["inputs"], action["output"])
+                    result = _merge(folder, action["inputs"], action["output"],
+                                     keep_parts=keep_parts)
+                    numbers = (f"merged {result['merged_s']} s against parts "
+                               f"{result['parts_s']} s, tolerance {result['tolerance_s']} s")
+                    if not result["verified"]:
+                        logged_action = "merge unverified"
+                        logged_reason = (
+                            f"{action['reason']}; merge unverified: {numbers}. Parts kept; "
+                            f"compare the files by hand before deleting anything"
+                        )
+                        print(f"  merge unverified: {numbers}")
+                        print(f"  parts kept: {', '.join(action['inputs'])}")
+                    elif not result["deleted"]:
+                        logged_reason = f"{action['reason']}; verified ({numbers}); parts kept (--keep-parts)"
+                        print(f"  verified: {numbers}; parts kept (--keep-parts)")
+                    else:
+                        logged_reason = f"{action['reason']}; verified ({numbers}); parts deleted"
+                        print(f"  verified: {numbers}; parts deleted")
                 elif kind == "rename":
                     src = os.path.join(folder, action["inputs"][0])
                     os.rename(src, output_path)
@@ -195,10 +283,10 @@ def apply(folder, actions, log_path):
 
             writer.writerow({
                 "timestamp": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-                "action": kind,
+                "action": logged_action,
                 "inputs": ";".join(action["inputs"]),
                 "output": action["output"],
-                "reason": action["reason"],
+                "reason": logged_reason,
             })
             log_fh.flush()
 
@@ -214,6 +302,9 @@ def main():
     parser.add_argument("folder", help="Season folder of raw videos, e.g. 2024_pbl")
     parser.add_argument("--apply", action="store_true", help="Carry out the plan (default is dry run: print only)")
     parser.add_argument("--log", default=None, help="Log CSV path (default: <folder>/prep_log.csv)")
+    parser.add_argument("--keep-parts", action="store_true",
+                         help="Never delete a merge's source parts, even when the merged "
+                              "duration verifies against them")
     args = parser.parse_args()
 
     folder = os.path.abspath(args.folder)
@@ -231,8 +322,10 @@ def main():
         print(f"{len(conflicts)} conflict(s) found; resolve by hand before re-running (see reasons above).")
 
     if args.apply:
-        apply(folder, actions, log_path)
+        apply(folder, actions, log_path, keep_parts=args.keep_parts)
         print(f"Applied {len(actions)} action(s). Log: {log_path}")
+        print("Any row logged as 'merge unverified' kept its parts: compare that merged file "
+              "against them before deleting anything.")
     else:
         print("Dry run only. Re-run with --apply to carry out this plan.")
 

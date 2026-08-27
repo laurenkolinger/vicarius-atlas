@@ -14,6 +14,14 @@ second, unprotected update of `video_location` / `video_location_verified` to
 the folder just ingested, so a rerun after the folder moves picks up the new
 location even for an existing row.
 
+A row whose readable id the operator corrected in the atlas after an earlier
+ingest is found again on the next run by its `original_videos` file name (at
+the same site and transect) rather than by the id recomputed from that name,
+so re-ingesting a folder never resurrects the old id as a second row for the
+same recording. On that path the identity cells (site, transect, year, season
+token) are left as the operator set them; only the ffprobe facts and the
+location are refreshed.
+
 Non-video files sitting in the folder (`prep_log.csv`, `atlasprep.md`, stray
 `.txt`/`.log` notes) are ignored outright; anything else whose name does not
 parse is only reported as a skipped/unparsed file if `ffprobe` confirms it is
@@ -67,11 +75,18 @@ def probe(path):
     return {"size_gb": size_gb, "duration_s": duration_s, "container": container, "codec": codec}
 
 
+# ffprobe reports "N/A" for size or duration on some containers, so probe()'s
+# int()/float() calls raise a plain ValueError. json.JSONDecodeError is a
+# ValueError subclass, so catching the parent covers both, and one odd file
+# never aborts the rest of the folder.
+PROBE_ERRORS = (subprocess.CalledProcessError, RuntimeError, ValueError)
+
+
 def _looks_like_video(path):
     """True if `ffprobe` can open `path` and finds at least one video stream."""
     try:
         probe(path)
-    except (subprocess.CalledProcessError, RuntimeError, json.JSONDecodeError):
+    except PROBE_ERRORS:
         return False
     return True
 
@@ -83,6 +98,22 @@ def _short_error(exc):
         if stderr:
             return stderr.splitlines()[-1][:200]
     return str(exc)[:200]
+
+
+def _row_for_video(name, site, transect):
+    """The registry row already ingested from video `name` at `site`/`transect`,
+    or None. Matched on original_videos, which no rename touches, so a row
+    whose readable id the operator corrected is found again rather than
+    duplicated."""
+    for row in registry.load():
+        if (row.get("original_videos") or "").strip() != name:
+            continue
+        if (row.get("site") or "").upper() != site.upper():
+            continue
+        if (row.get("transect") or "").upper() != transect.upper():
+            continue
+        return row
+    return None
 
 
 def ingest_folder(folder, actor="ingest", dry_run=False):
@@ -117,24 +148,44 @@ def ingest_folder(folder, actor="ingest", dry_run=False):
 
         try:
             facts = probe(path)
-        except (subprocess.CalledProcessError, RuntimeError, json.JSONDecodeError) as exc:
+        except PROBE_ERRORS as exc:
             results.append({"file": name, "readable_id": rid, "status": "skipped",
                              "reason": f"ffprobe failed: {_short_error(exc)}"})
             continue
 
         existing = registry.get(rid)
+        renamed = None
+        if existing is None:
+            # The readable id derived from the file name is not the only place
+            # this video may already live: the review step the spec asks for
+            # includes renaming a row whose season was derived wrong, and a
+            # rename moves the key. Recomputing the id and finding nothing
+            # would create a second row for the same recording, and both would
+            # be selected for processing. So look for the row by what cannot
+            # be renamed: the video file it was ingested from, at the same
+            # site and transect.
+            renamed = _row_for_video(name, parsed["site"], parsed["transect"])
+            if renamed is not None:
+                existing, rid = renamed, renamed["readable_id"]
         status = "updated" if existing is not None else "created"
 
         fields = {
-            "site": parsed["site"],
-            "transect": parsed["transect"],
-            "year": parsed["date"][:4],
-            "season_token": naming3d.season_token(parsed["date"]),
             "original_videos": name,
             "video_size_gb": facts["size_gb"],
             "video_duration_s": facts["duration_s"],
             "video_format": f"{facts['container']}/{facts['codec']}",
         }
+        if renamed is None:
+            # Identity from the file name. Skipped for a row reached through a
+            # rename: that row's identity is what the operator corrected it to,
+            # and year is not an operator-protected column, so writing it back
+            # would undo half of the rename.
+            fields.update({
+                "site": parsed["site"],
+                "transect": parsed["transect"],
+                "year": parsed["date"][:4],
+                "season_token": naming3d.season_token(parsed["date"]),
+            })
         if existing is None:
             fields["ingested_at"] = registry.now()
 
@@ -147,7 +198,8 @@ def ingest_folder(folder, actor="ingest", dry_run=False):
             registry.upsert(rid, {"video_location": folder, "video_location_verified": registry.now()},
                              actor, protect_operator=False)
 
-        results.append({"file": name, "readable_id": rid, "status": status, "reason": ""})
+        reason = "" if renamed is None else "matched an existing row renamed after an earlier ingest"
+        results.append({"file": name, "readable_id": rid, "status": status, "reason": reason})
 
     return results
 
