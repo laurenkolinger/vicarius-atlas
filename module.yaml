@@ -101,4 +101,5 @@ docs:
   readme: "README.md"                                    # what the atlas shows, editing rules, the live panel, the notices
   ingest_procedure: "atlasprep.md"                        # preparing a raw video folder before ingest: merging parts, normalizing names
   ingest_script: "atlasingest.py"                         # `python3 atlasingest.py <folder> [--dry-run]`, writes registry rows
+  catalog_script: "atlascatalog.py"                       # `python3 atlascatalog.py [--nas-config <path>] [--root <root>]... [--dry-run]`, read-only Archive walk into registry rows, run before ingest
   registry_contract: "../../../_METADATA/3d/README.md"    # the platform TCRMP 3D registry: columns, operator-edited cells, the lock + event log

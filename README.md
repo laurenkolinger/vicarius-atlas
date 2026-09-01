@@ -77,6 +77,63 @@ new row before the timepoint is processed: check the readable id and season
 token, correct them in place if the survey season is wrong, and uncheck
 `process` for lit/unlit duplicates and bad takes.
 
+## Catalog: walking the Archive into registry rows before any transfer
+
+`atlascatalog.py` is a read-only reconnaissance step over the NAS Archive,
+separate from ingest above and run before it. It lists, parses, and records;
+it never transfers a file. It reads the same NAS credentials and config the
+carousel driver module uses (`driver/github_repo/config/nas.yaml`: host,
+user, key, `source_roots`) and talks to the NAS only through plain ssh
+LISTING commands (a recursive `find`) -- no file is ever pulled down, and
+nothing on the NAS is ever renamed. The Archive stays read-only end to end.
+
+For each season root it walks recursively (nested folders are expected
+weirdness, not an error), it parses filenames with the same shared rule
+ingest uses (`naming3d.parse_video_name`) and groups multi-part recordings
+(both spellings in `atlasprep.md`: a bare numeric suffix and a literal
+`part` word) into one timepoint row using `prep_tools.group_video_names` --
+the identical part-set grouping `prep_tools.plan()` uses to plan a local
+merge, extracted into a shared pure helper so the rule exists exactly once.
+Grouping happens within one directory only: a part set whose files sit
+under two different directories is ambiguous and is never merged by guess.
+
+Each row records: the identity cells (`site`, `transect`, `year`,
+`season_token`) from the parsed name, `original_videos` (every source file
+in the set, `;`-joined per the registry's multi-part convention), the
+Archive-facing `video_location` as `146.226.147.140:<absolute Archive
+path>`, and `video_size_gb` summed from the sizes the ssh listing reports.
+There is no ffprobe pass here -- the files are remote -- so duration and
+container/codec facts are left blank until the real ingest runs. Every write
+goes through `registry.upsert(rid, fields, actor="catalog",
+protect_operator=True)`, and unlike ingest's own two-call pattern, the
+catalog's single upsert call protects every operator column blanket,
+`video_location` included: **once a video's `video_location` cell is
+filled, the catalog will never correct it, even after a later parsing fix
+moves that video's identity to a different row.** Rerunning against an
+unchanged Archive changes nothing (idempotent, same as ingest).
+
+Anything that does not parse clean -- a bad name, a canonical file sitting
+alongside leftover parts, or a part set split across directories -- is left
+out of the registry and reported instead: printed at the end of every run
+and written to `catalog_needs_attention.csv` in the registry data root
+(`vicarius/_METADATA/3d/`, or wherever `VICARIUS_3D_REGISTRY_ROOT` points).
+A season root that is not mounted or not listable is reported plainly
+("this season's drive is not mounted") and skipped.
+
+CLI: `python3 atlascatalog.py [--nas-config <path>] [--root <NAS season
+root>]... [--dry-run]`. With no `--root`, the season roots come from
+`--nas-config`'s `source_roots` (default: the carousel's
+`driver/github_repo/config/nas.yaml`). `--dry-run` computes and prints
+everything without writing to the registry or the needs-attention report's
+underlying data.
+
+The catalog's rows are deliberately incomplete: no duration, no
+container/codec, and a `video_location` that can go stale. The full ingest
+-- part merging with duration verification, ffprobe facts, on-disk renaming
+to the standard name -- happens later, at pull time on the Workbench, once
+the files are local, through the same `prep_tools.py` / `atlasingest.py`
+pair documented above.
+
 ## Editing rules
 
 Only the cells `registry.OPERATOR_COLUMNS` names are editable here:
@@ -175,8 +232,12 @@ ingest and before step 1 has run).
 
 ## What other modules write
 
-The atlas is a view and an edit surface over a registry three writers share:
+The atlas is a view and an edit surface over a registry several writers share:
 
+- **Catalog** (`atlascatalog.py`, above) creates a row per timepoint it
+  finds on the Archive and keeps `video_location`/`video_size_gb` current,
+  identity cells included, all through one `protect_operator=True` upsert.
+  It writes nothing else -- no ffprobe facts, no `ingested_at`.
 - **Ingest** (`atlasingest.py`, above) creates rows and keeps
   `video_location`/`video_size_gb`/`video_duration_s`/`video_format`/`ingested_at`
   current.

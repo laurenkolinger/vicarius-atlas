@@ -38,6 +38,46 @@ def _ext(filename):
     return filename[filename.rindex("."):] if "." in filename else ""
 
 
+def group_video_names(names):
+    """Bucket `names` by parsed identity and classify each group's members
+    into parts vs. a canonical file. Pure: takes a list of filenames (no
+    filesystem access), so `plan()` and any other caller -- currently also
+    `atlascatalog.py` in this same repo, walking a remote listing instead of
+    a local folder -- can reuse exactly the same grouping and part-order
+    rules without touching disk.
+
+    A name that does not parse as a TCRMP 3D video name
+    (`naming3d.parse_video_name` returns None) is left out of every group.
+
+    Returns one dict per identity group, sorted by (project, date, site,
+    transect):
+    {"key": (project, date, site, transect),
+     "output": standard-form output filename for this group,
+     "members": [(name, parsed), ...] in part order (unparted members last),
+     "parts": the members carrying a part number,
+     "canonical": the (name, parsed) tuple whose name already equals
+     `output`, or None}.
+    """
+    groups = defaultdict(list)
+    for name in names:
+        parsed = parse_video_name(name)
+        if parsed is None:
+            continue
+        key = (parsed["project"], parsed["date"], parsed["site"], parsed["transect"])
+        groups[key].append((name, parsed))
+
+    result = []
+    for key, members in sorted(groups.items()):
+        members = sorted(members, key=lambda m: (m[1]["part"] is None, m[1]["part"] or 0, m[0]))
+        project, date, site, transect = key
+        output = f"{project}{date}_3D_{site}_{transect}{_ext(members[0][0])}"
+        parts = [m for m in members if m[1]["part"] is not None]
+        canonical = next((m for m in members if m[1]["part"] is None and m[0] == output), None)
+        result.append({"key": key, "output": output, "members": members,
+                        "parts": parts, "canonical": canonical})
+    return result
+
+
 def plan(folder):
     """Read `folder` and return one action dict per output file.
 
@@ -51,23 +91,12 @@ def plan(folder):
     files for the same key. Nothing about a conflict is safe to guess: the
     plan flags it and `apply()` leaves every file involved untouched.
     """
-    groups = defaultdict(list)
-    for name in sorted(os.listdir(folder)):
-        if not os.path.isfile(os.path.join(folder, name)):
-            continue
-        parsed = parse_video_name(name)
-        if parsed is None:
-            continue
-        key = (parsed["project"], parsed["date"], parsed["site"], parsed["transect"])
-        groups[key].append((name, parsed))
+    names = [n for n in sorted(os.listdir(folder)) if os.path.isfile(os.path.join(folder, n))]
 
     actions = []
-    for (project, date, site, transect), members in sorted(groups.items()):
-        members.sort(key=lambda m: (m[1]["part"] is None, m[1]["part"] or 0, m[0]))
-        output = f"{project}{date}_3D_{site}_{transect}{_ext(members[0][0])}"
-
-        parts = [m for m in members if m[1]["part"] is not None]
-        canonical = next((m for m in members if m[1]["part"] is None and m[0] == output), None)
+    for group in group_video_names(names):
+        output, members = group["output"], group["members"]
+        parts, canonical = group["parts"], group["canonical"]
 
         if len(parts) >= 2:
             part_inputs = [m[0] for m in parts]
