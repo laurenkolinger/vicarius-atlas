@@ -114,11 +114,18 @@ unchanged Archive changes nothing (idempotent, same as ingest).
 
 Anything that does not parse clean -- a bad name, a canonical file sitting
 alongside leftover parts, or a part set split across directories -- is left
-out of the registry and reported instead: printed at the end of every run
-and written to `catalog_needs_attention.csv` in the registry data root
-(`vicarius/_METADATA/3d/`, or wherever `VICARIUS_3D_REGISTRY_ROOT` points).
-A season root that is not mounted or not listable is reported plainly
-("this season's drive is not mounted") and skipped.
+out of the registry and reported instead: printed at the end of every run,
+and (on a real, non-dry-run run) written to `catalog_needs_attention.csv` in
+the registry data root (`vicarius/_METADATA/3d/`, or wherever
+`VICARIUS_3D_REGISTRY_ROOT` points). A season root that is not mounted or
+not listable is reported plainly ("this season's drive is not mounted") and
+skipped.
+
+A file whose extension marks it as a non-video companion (`.csv`, `.txt`,
+`.md`, `.log` -- `prep_log.csv`, `atlasprep.md`, stray notes) is excluded
+silently before parsing, the same convention `atlasingest.py` uses: it never
+becomes part of a row and never triggers a needs-attention entry, even when
+its name shares a stem with a real video sitting next to it.
 
 CLI: `python3 atlascatalog.py [--nas-config <path>] [--root <NAS season
 root>]... [--dry-run]`. With no `--root`, the season roots come from

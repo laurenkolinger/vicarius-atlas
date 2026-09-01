@@ -22,18 +22,25 @@ Every write goes through `registry.upsert(rid, fields, actor="catalog",
 protect_operator=True)`, so nothing an operator has already hand-edited is
 ever clobbered. A rerun against an unchanged Archive changes nothing.
 
+A `.csv`/`.txt`/`.md`/`.log` companion (`prep_log.csv`, `atlasprep.md`,
+stray notes) is excluded before parsing, the same convention
+`atlasingest.py` uses -- even one sharing a stem with a real video, since
+`naming3d.parse_video_name` matches on the stem and does not look at the
+extension.
+
 Anything that does not parse clean -- a bad name, a canonical file sitting
 alongside leftover parts, or a part set whose members are split across more
 than one directory -- is left out of the registry entirely and reported in
-the "needs attention" list instead: printed at the end of every run and
-written to `catalog_needs_attention.csv` in the registry data root. A season
-root that is not mounted or not listable is reported plainly ("this
-season's drive is not mounted") and skipped.
+the "needs attention" list instead: printed at the end of every run and (on
+a real, non-dry-run run) written to `catalog_needs_attention.csv` in the
+registry data root. A season root that is not mounted or not listable is
+reported plainly ("this season's drive is not mounted") and skipped.
 
 CLI: `python3 atlascatalog.py [--nas-config <path>] [--root <NAS season
 root>]... [--dry-run]`. With no `--root`, the season roots come from
 `--nas-config`'s `source_roots`. `--dry-run` computes and prints everything
-without writing to the registry.
+-- rows and the needs-attention list both -- without writing to the
+registry or to the needs-attention report file.
 """
 import argparse
 import csv
@@ -129,9 +136,25 @@ def _catalog_one_root(root, entries, archive_host, actor, dry_run):
     Grouping happens within one directory only -- a part set whose members
     sit in different directories is ambiguous and never merged by guess.
     """
+    # Expected non-video companions (prep_log.csv, atlasprep.md, stray notes)
+    # are excluded here, once, before anything else sees the listing --
+    # naming3d.parse_video_name matches on the filename stem and does not
+    # care about the extension, so a same-stem companion (e.g.
+    # TCRMP20240412_3D_MRS_T1.csv beside the matching .MP4) parses cleanly
+    # and would otherwise silently join the video's group: neither a "part"
+    # nor byte-for-byte the canonical name, so it would pass the
+    # canonical-vs-parts conflict check unflagged while still counting
+    # toward that row's original_videos and video_size_gb. Filtering by_dir
+    # itself, ahead of both the bad-name pass and the grouping pass below,
+    # is what keeps the two passes from disagreeing about which names are
+    # even candidates.
     by_dir = defaultdict(list)  # dirpath -> [(basename, size, relpath)]
     for relpath, size in entries:
-        by_dir[posixpath.dirname(relpath)].append((posixpath.basename(relpath), size, relpath))
+        basename = posixpath.basename(relpath)
+        ext = os.path.splitext(basename)[1].lower()
+        if ext in NON_VIDEO_EXTENSIONS:
+            continue
+        by_dir[posixpath.dirname(relpath)].append((basename, size, relpath))
 
     needs_attention = []
     rows = []
@@ -142,9 +165,6 @@ def _catalog_one_root(root, entries, archive_host, actor, dry_run):
     key_dirs = defaultdict(set)
     for dirpath, members in by_dir.items():
         for basename, _size, relpath in members:
-            ext = os.path.splitext(basename)[1].lower()
-            if ext in NON_VIDEO_EXTENSIONS:
-                continue
             parsed = naming3d.parse_video_name(basename)
             if parsed is None:
                 needs_attention.append({"root": root, "path": posixpath.join(root, relpath),
@@ -297,8 +317,11 @@ def main(argv=None):
     _print_rows(rows)
     _print_needs_attention(needs_attention)
 
-    report_path = write_needs_attention_report(needs_attention)
-    print(f"\nNeeds-attention report: {report_path}")
+    if args.dry_run:
+        print("\nDRY RUN: needs-attention report not written.")
+    else:
+        report_path = write_needs_attention_report(needs_attention)
+        print(f"\nNeeds-attention report: {report_path}")
 
 
 if __name__ == "__main__":

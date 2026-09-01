@@ -116,6 +116,29 @@ class AtlasCatalogTests(unittest.TestCase):
         self.assertEqual(row["original_videos"],
                           "TCRMP20250110_3D_BID_T2_part1.MP4;TCRMP20250110_3D_BID_T2_part2.MP4")
 
+    def test_matching_stem_non_video_companion_excluded_from_row_silently(self):
+        # naming3d.parse_video_name matches on the filename stem and ignores
+        # the extension, so a same-stem .csv (prep_log.csv-style companion)
+        # would parse just as cleanly as the real video. It must never join
+        # the group: not in original_videos, not counted in video_size_gb,
+        # and -- since it is an expected companion, not a bad name -- no
+        # needs-attention entry either.
+        root = "/volume4/Archive6_16TB/2024_annual"
+        listings = {root: [
+            ("TCRMP20240412_3D_MRS_T1.MP4", 5_000_000_000),
+            ("TCRMP20240412_3D_MRS_T1.csv", 1_000_000_000),
+        ]}
+        ssh = self._ssh(listings)
+
+        rows, needs_attention = atlascatalog.catalog_roots([root], ssh, actor="catalog")
+
+        self.assertEqual(needs_attention, [])
+        self.assertEqual(len(rows), 1)
+        row = self.r.get("MRS_T1_2024_pbl")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["original_videos"], "TCRMP20240412_3D_MRS_T1.MP4")
+        self.assertEqual(row["video_size_gb"], "5.0")
+
     # --- idempotency ------------------------------------------------------
 
     def test_idempotent_rerun_byte_identical_registry_csv(self):
@@ -288,6 +311,61 @@ class AtlasCatalogTests(unittest.TestCase):
         self.assertIn("DRY RUN", output)
         self.assertIn("MRS_T1_2024_pbl", output)
         self.assertEqual(self.r.load(), [])
+        # A dry run must not write the needs-attention report either -- it
+        # is beside the registry data, but still registry-adjacent state,
+        # and the CLI contract promises --dry-run touches nothing.
+        report_path = os.path.join(self.registry_root, atlascatalog.NEEDS_ATTENTION_FILENAME)
+        self.assertFalse(os.path.exists(report_path))
+
+    def test_dry_run_creates_no_registry_root_and_writes_no_report_file(self):
+        # A registry root that does not exist yet (unlike self.registry_root,
+        # which tempfile.mkdtemp() already created in setUp): a dry run must
+        # never call os.makedirs on it and must never write the report file
+        # into it, even when the run does find something needing attention.
+        nested_root = os.path.join(self.registry_root, "not_yet_created")
+        os.environ["VICARIUS_3D_REGISTRY_ROOT"] = nested_root
+        importlib.reload(registry)
+        self.r = registry
+        self.assertFalse(os.path.exists(nested_root), "test setup error: root must not pre-exist")
+
+        fd, cfg_path = tempfile.mkstemp(suffix=".yaml")
+        os.close(fd)
+        self.addCleanup(os.remove, cfg_path)
+        root = "/volume4/Archive6_16TB/2024_annual"
+        with open(cfg_path, "w") as f:
+            f.write(f"host: 146.226.147.140\nuser: driver_svc\nkey: /fake/key\n"
+                     f"source_roots:\n  - {root}\n")
+
+        # A bad name, so there IS something the report would otherwise hold.
+        listings = {root: [("GOPR0001.MP4", 1_000_000_000)]}
+
+        def fake_runner(argv, timeout=60):
+            root_arg = argv[1]
+            entries = listings.get(root_arg)
+            if entries is None:
+                return (1, "", "no such path")
+            payload = "".join(f"{size}\0{relpath}\0" for relpath, size in entries)
+            return (0, payload, "")
+
+        real_ssh_cls = atlascatalog.SSH
+
+        class StubSSH(real_ssh_cls):
+            def __init__(self, host, user, key, runner=None):
+                super().__init__(host, user, key, runner=fake_runner)
+
+        atlascatalog.SSH = StubSSH
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                atlascatalog.main(["--nas-config", cfg_path, "--dry-run"])
+        finally:
+            atlascatalog.SSH = real_ssh_cls
+
+        output = buf.getvalue()
+        self.assertIn("GOPR0001.MP4", output, "the needs-attention item must still be printed")
+        self.assertFalse(os.path.exists(nested_root),
+                          "a dry run must never create the registry data root")
+        self.assertFalse(os.path.exists(os.path.join(nested_root, atlascatalog.NEEDS_ATTENTION_FILENAME)))
 
 
 class PrepToolsGroupingExtractionTests(unittest.TestCase):
