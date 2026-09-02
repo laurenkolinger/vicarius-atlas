@@ -1,4 +1,4 @@
-import contextlib, csv, importlib, io, os, shutil, sys, tempfile, unittest
+import contextlib, csv, importlib, io, os, shlex, shutil, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -35,6 +35,51 @@ class AtlasCatalogTests(unittest.TestCase):
             payload = "".join(f"{size}\0{relpath}\0" for relpath, size in entries)
             return (0, payload, "")
         return atlascatalog.SSH(host, "driver_svc", "/fake/driver_svc_key", runner=runner)
+
+    # --- SSH real runner argv quoting (regression) ----------------------
+
+    def test_real_run_quotes_remote_argv_so_printf_format_survives_shell_word_splitting(self):
+        """Regression test for the zero-rows-against-a-real-NAS bug: `SSH._real_run`
+        used to append the remote argv to the ssh command unquoted. ssh
+        concatenates that argv with spaces and hands the resulting string to
+        the *remote* shell verbatim, so the -printf format's `\\0` escapes
+        lost their backslashes there before `find` ever saw them, and the
+        listing came back empty. This never touches the network: it patches
+        `subprocess.run` to capture the exact command `_real_run` composes,
+        then `shlex.split`s the remote-side portion the same way a POSIX
+        shell parses whatever ssh hands it -- proving the composed command
+        round-trips back to the original argv byte-identical, including the
+        backslash-zero, only when each remote arg is shell-quoted."""
+        remote_argv = ["find", "/volume4/Archive6_16TB/2024_annual", "-mindepth", "1",
+                       "-type", "f", "-printf", r"%s\0%P\0"]
+        captured = {}
+
+        def fake_subprocess_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        ssh = atlascatalog.SSH("146.226.147.140", "driver_svc", "/fake/driver_svc_key")
+        real_subprocess_run = atlascatalog.subprocess.run
+        atlascatalog.subprocess.run = fake_subprocess_run
+        try:
+            ssh._real_run(remote_argv)
+        finally:
+            atlascatalog.subprocess.run = real_subprocess_run
+
+        cmd = captured["cmd"]
+        target_index = cmd.index(ssh.target)
+        remote_side = cmd[target_index + 1:]
+        # Exactly what ssh concatenates with spaces and hands the remote
+        # shell as one command line -- so shlex.split-ing it here reproduces
+        # that remote shell's word-splitting/quote-removal pass.
+        remote_command_string = " ".join(remote_side)
+        parsed = shlex.split(remote_command_string)
+
+        self.assertEqual(parsed, remote_argv,
+                          "the composed remote command must round-trip through one shell parse "
+                          "back to the exact original argv -- including the -printf format's "
+                          "backslash-zero -- or the remote find never receives it intact and the "
+                          "ssh listing silently returns zero rows")
 
     # --- basic parse + row creation -----------------------------------
 

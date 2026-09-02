@@ -46,6 +46,7 @@ import argparse
 import csv
 import os
 import posixpath
+import shlex
 import subprocess
 import sys
 from collections import defaultdict
@@ -86,8 +87,13 @@ class SSH:
         self.runner = runner or self._real_run
 
     def _real_run(self, argv, timeout=60):
+        # Each remote-side argument must be shell-quoted: ssh concatenates
+        # argv with spaces and hands the result to the *remote* shell
+        # verbatim, so an unquoted find -printf escape like `\0` gets its
+        # backslash stripped by that shell before find ever sees it. Mirrors
+        # driver/remote.py's SSH.run, which quotes for the same reason.
         cmd = ["ssh", "-i", self.key, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-               "-o", "StrictHostKeyChecking=accept-new", self.target] + list(argv)
+               "-o", "StrictHostKeyChecking=accept-new", self.target] + [shlex.quote(a) for a in argv]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             return (p.returncode, p.stdout, p.stderr)
