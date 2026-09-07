@@ -35,7 +35,7 @@
 # ==============================================================================
 
 name: "tcrmp_3d_atlas"
-display_name: "TCRMP 3D Atlas"          # short human title on the UI card; REQUIRED
+display_name: "ATLAS"                   # short human title on the UI card; REQUIRED. V-fleet name per Lauren 2026-09-02 (was TCRMP 3D Atlas)
 tags: ["TCRMP", "3D"]                    # filter chips; REQUIRED
 hidden: false
 hidden_reason: ""
@@ -61,7 +61,14 @@ inputs:
     formats: [".csv", ".yaml"]
     location: "vicarius/_METADATA/3d/ (tcrmp_3d_registry.csv, events.csv, snapshots/)"
     required: true
-    description: "The platform TCRMP 3D registry: tcrmp_3d_registry.csv (one row per transect timepoint), events.csv (append-only edit log), and snapshots/<readable_id>/ (point-in-time captures for timepoints no longer on disk). The atlas reads it on every request (GET /atlas/api/rows, /api/detail, /api/console, /api/report) and writes operator-edited cells through POST /atlas/api/edit; every read and write goes through vicarius/_METADATA/3d/registry.py, which holds an exclusive file lock and replaces the CSV atomically so a concurrent module write can never be torn. Never read or written directly by this module outside that library."
+    description: "The platform TCRMP 3D registry: tcrmp_3d_registry.csv (one row per transect timepoint), events.csv (append-only edit log), and snapshots/<readable_id>/ (point-in-time captures for timepoints no longer on disk). The atlas reads it on every request (GET /atlas/api/rows, /api/detail, /api/console, /api/report) and writes operator-edited cells through POST /atlas/api/edit and POST /atlas/api/delete; every read and write goes through vicarius/_METADATA/3d/registry.py, which holds an exclusive file lock and replaces the CSV atomically so a concurrent module write can never be torn. Never read or written directly by this module outside that library. The sidecar files the Voyager program added beside this registry are a separate input, below."
+
+  - name: "tcrmp_3d_registry_sidecars"
+    type: "directory"
+    formats: [".csv", ".json"]
+    location: "vicarius/_METADATA/3d/ (source_files.csv, deleted_rows.csv, processing_order.csv, row_facts.csv, seasons.csv, catalog_overrides.csv, catalog_needs_attention.csv, manual_edit/)"
+    required: false
+    description: "The sidecar files beside the registry that carry facts no registry column holds: per-file records behind a row (source_files.csv, read by GET /atlas/api/sources/<id> for the detail row's Source videos table), the delete archive (deleted_rows.csv, written by POST /atlas/api/delete and the Registry hygiene block), the processing order (processing_order.csv, edited only in Voyager tools, read for the table's default sort and the order chip), per-row facts by section (row_facts.csv, the source of the detail row's Voyager 1, Manual edit, Voyager 2 and Vigil sections, read through GET /atlas/api/facts/<id>), season metadata (seasons.csv, the camera model and preprocessing tooltips), the catalog's site relabelling (catalog_overrides.csv) and its needs-attention report (catalog_needs_attention.csv, the header strip's need attention tally), and the manual edit job store (manual_edit/, read only through GET /atlas/api/now for the Now strip's manual edit block; every write to it belongs to the manual_edit module). Every one of these is written only through vicarius/_METADATA/3d/registry.py or, for the job store, vicarius/modules/manual_edit/github_repo/manualedit/jobstore.py. The atlas reads all of them; the only write this module makes is registry.delete_row from POST /atlas/api/delete and the Registry hygiene block, which appends to deleted_rows.csv and removes the deleted row's lines from source_files.csv and processing_order.csv. Every other line in these files is written by the catalog, Voyager 1, Start manual edit or Voyager tools, described in README.md."
 
 # ------------------------------------------------------------------------------
 # OUTPUTS - no data-dictionary contract
@@ -98,8 +105,8 @@ ui:
 # Not a schema field the platform parses; kept here so an operator opening
 # this file finds every related doc without hunting.
 docs:
-  readme: "README.md"                                    # what the atlas shows, editing rules, the live panel, the notices
+  readme: "README.md"                                    # what the atlas shows, editing rules, the Now strip, the notices, the matrix and Start manual edit
   ingest_procedure: "atlasprep.md"                        # preparing a raw video folder before ingest: merging parts, normalizing names
   ingest_script: "atlasingest.py"                         # `python3 atlasingest.py <folder> [--dry-run]`, writes registry rows
-  catalog_script: "atlascatalog.py"                       # `python3 atlascatalog.py [--nas-config <path>] [--root <root>]... [--dry-run]`, read-only Archive walk into registry rows, run before ingest
+  catalog_script: "atlascatalog.py"                       # `python3 atlascatalog.py [--nas-config <path>] [--root <root>]... [--overrides <path>] [--name-variant demo|3ddemo]... [--dry-run]`, read-only Archive walk into registry rows, run before ingest
   registry_contract: "../../../_METADATA/3d/README.md"    # the platform TCRMP 3D registry: columns, operator-edited cells, the lock + event log
