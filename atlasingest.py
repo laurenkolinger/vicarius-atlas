@@ -52,6 +52,11 @@ REVIEW_INSTRUCTION = (
 # to rule out: prep_log.csv, atlasprep.md, and any stray text notes sitting
 # in the season folder are ignored before we even try to parse their name.
 NON_VIDEO_EXTENSIONS = {".csv", ".txt", ".md", ".log"}
+# Exit code when a video file in the folder was not ingested. A skipped file is
+# a recording that did not reach the registry, and until 2026-09-08 this script
+# exited zero however many it skipped, so the Carousel, which reads the exit
+# code and nothing else, recorded the season as ingested.
+EXIT_SKIPPED = 2
 
 
 def probe(path):
@@ -232,6 +237,16 @@ def main():
     _print_table(results)
     print()
     print(REVIEW_INSTRUCTION)
+
+    skipped = [r for r in results if r["status"] == "skipped"]
+    if skipped:
+        print()
+        for r in skipped:
+            print(f"NOT INGESTED: {r['file']} ({r['reason']})")
+        print(f"{len(skipped)} video file(s) in {args.folder} were not ingested and are in no "
+              f"registry row. Each one is a recording this folder holds and the registry does "
+              f"not know about.")
+        sys.exit(EXIT_SKIPPED)
 
 
 if __name__ == "__main__":

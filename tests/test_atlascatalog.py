@@ -7,7 +7,7 @@ goes to a temporary root through VICARIUS_3D_REGISTRY_ROOT plus a reload.
 Run: cd /mnt/rip/vicarius_drive/vicarius/modules/tcrmp_3d_atlas/github_repo
      && python3 -m unittest discover -s tests -q
 """
-import contextlib, csv, importlib, io, os, shlex, shutil, subprocess, sys, tempfile, threading, time, unittest
+import contextlib, csv, fnmatch, importlib, io, os, posixpath, shlex, shutil, subprocess, sys, tempfile, threading, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -405,11 +405,15 @@ class AtlasCatalogTests(_CatalogCase):
         self.assertEqual(needs_attention[0]["reason"], "name does not match TCRMP{YYYYMMDD}_3D_{SITE}_{T#}")
         self.assertIn("GOPR0001.MP4", needs_attention[0]["path"])
 
-    def test_needs_attention_catches_ambiguous_part_set_split_across_directories(self):
+    def test_needs_attention_catches_an_incomplete_part_set_split_across_directories(self):
+        # Until 2026-09-14 any part set spanning directories was refused; a
+        # complete one (parts 1 and 2 in two folders) is now one recording
+        # (CrossFolderPartsTests). A set that is not complete across the
+        # folders, here parts 1 and 3, keeps the refusal.
         root = "/volume4/Archive6_16TB/2024_annual"
         listings = {root: [
             ("dirA/TCRMP20240412_3D_MRS_T1_1.MP4", 1_000_000_000),
-            ("dirB/TCRMP20240412_3D_MRS_T1_2.MP4", 1_000_000_000),
+            ("dirB/TCRMP20240412_3D_MRS_T1_3.MP4", 1_000_000_000),
         ]}
         ssh = self._ssh(listings)
 
@@ -418,7 +422,7 @@ class AtlasCatalogTests(_CatalogCase):
         self.assertEqual(rows, [])
         self.assertEqual(len(needs_attention), 1)
         self.assertIn("split across directories", needs_attention[0]["reason"])
-        self.assertEqual(self.r.load(), [], "an ambiguous split part set must not write any row")
+        self.assertEqual(self.r.load(), [], "an incomplete split part set must not write any row")
 
     def test_needs_attention_catches_canonical_alongside_leftover_part(self):
         root = "/volume4/Archive6_16TB/2024_annual"
@@ -617,8 +621,9 @@ class ListingTests(_CatalogCase):
         self.assertEqual(atlascatalog.list_root(ssh, ROOT_2024), [])
         argv = seen["argv"]
         self.assertEqual(argv[:4], ["find", ROOT_2024, "-mindepth", "1"])
-        self.assertEqual(argv[4:11], ["(", "-name", "@*", "-o", "-name", "#recycle", ")"])
-        self.assertEqual(argv[11:], ["-prune", "-o", "-type", "f", "-printf", r"%s\0%P\0"])
+        self.assertEqual(argv[4:10], ["(", "-name", "@*", "-o", "-name", "#recycle"])
+        self.assertEqual(argv[4:], ["(", "-name", "@*", "-o", "-name", "#recycle", "-o", *atlascatalog.PROCESSING_PRUNE_TERMS, ")",
+                                    "-prune", "-o", "-type", "f", "-printf", r"%s\0%P\0"])
         for name in atlascatalog.PRUNED_NAMES:
             self.assertIn(name, argv)
 
@@ -670,6 +675,313 @@ class ListingTests(_CatalogCase):
             atlascatalog.catalog([""], ssh)
 
 
+class ExclusionTests(_CatalogCase):
+    """The Shelf and the merged root are never listed or catalogued.
+
+    On 2026-09-14 the Carousel's Shelf (defaults.shelf_root in nas.yaml,
+    /volume6/Archive8_12TB/driver_deposits) sat inside the source root
+    /volume6/Archive8_12TB, and a dry run reported 61,216 frames, scripts and
+    byte-code files from four deposited processing folders as names that do
+    not match, beside 46 real findings. Two layers keep them out: the find
+    prunes the excluded paths on the NAS, and catalog() drops whatever is
+    listed under one anyway.
+    """
+
+    SOURCE = "/volume6/Archive8_12TB"
+    SHELF = "/volume6/Archive8_12TB/driver_deposits"
+    MERGED = "/volume5/Archive10_20TB"
+    # What one deposited processing folder looks like beside a season folder,
+    # as the 2026-09-14 dry run listed it: a lock, a project, byte code, a
+    # frame that parses as nothing, and a re-encoded video whose name parses
+    # and would become a row or a second-take line of its own.
+    SHELF_SPEC = """
+        TCRMP_2024Annual/TCRMP20240412_3D_MRS_T1.MP4 5000000000
+        driver_deposits/TCRMP_11sep26_LO_MRS1+FLC3_23ann-25pbl/FLC_T3_3D/.processing.lock 10
+        driver_deposits/TCRMP_11sep26_LO_MRS1+FLC3_23ann-25pbl/FLC_T3_3D/FLC_T3_2023_2025.psx 100
+        driver_deposits/TCRMP_11sep26_LO_MRS1+FLC3_23ann-25pbl/FLC_T3_3D/.venv/lib/site.pyc 100
+        driver_deposits/TCRMP_11sep26_LO_MRS1+FLC3_23ann-25pbl/FLC_T3_3D/frames/FLC_T3_2025_pbl/TCRMP20250327_3D_FLC_T3_frame_000001.jpg 100
+        driver_deposits/TCRMP_11sep26_LO_MRS1+FLC3_23ann-25pbl/MRS_T3_3D/frames/MRS_T3_2023ann/TCRMP20231207_3D_MRS_T3.MP4 100
+    """
+    SHELF_FILES = 5
+    MERGED_SPEC = """
+        Archive9/TCRMP20240412_3D_SHR_T1.MP4
+        Archive10_20TB/2024_annual/TCRMP20240412_3D_MRS_T2.MP4
+    """
+
+    def _pruning_runner(self, listings):
+        """A fake find that honours its -path prune terms, as the NAS does."""
+        def runner(argv, timeout=60):
+            root = argv[1]
+            pruned = [argv[i + 1] for i, word in enumerate(argv) if word == "-path"]
+            entries = listings.get(root)
+            if entries is None:
+                return (1, "", f"find: '{root}': No such file or directory")
+            kept = [(rel, size) for rel, size in entries
+                    if not any(posixpath.join(root, rel) == p or posixpath.join(root, rel).startswith(p + "/")
+                               for p in pruned)]
+            return (0, "".join(f"{size}\0{rel}\0" for rel, size in kept), "")
+        return runner
+
+    def _write_config_with_exclusions(self, roots):
+        """A nas.yaml naming `roots` as source_roots plus the Shelf and merged root."""
+        fd, cfg_path = tempfile.mkstemp(suffix=".yaml")
+        os.close(fd)
+        self.addCleanup(os.remove, cfg_path)
+        with open(cfg_path, "w") as f:
+            f.write(f"host: {HOST}\nuser: driver_svc\nkey: /fake/key\nsource_roots:\n")
+            f.writelines(f"  - {root}\n" for root in roots)
+            f.write(f"merged_root: {self.MERGED}\ndefaults:\n  shelf_root: {self.SHELF}\n")
+        return cfg_path
+
+    # --- layer two: catalog() drops what was listed under an excluded path ---
+
+    def test_entries_under_the_shelf_are_dropped_and_never_reach_rows_or_the_report(self):
+        run = self._catalog({self.SOURCE: _names(self.SHELF_SPEC)}, excluded=[self.SHELF])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.listed_files, self.SHELF_FILES + 1)
+        self.assertEqual(run.excluded_files, self.SHELF_FILES)
+        self.assertEqual(run.roots_listed, 1)
+        self.assertEqual([f["file_name"] for f in self._sidecar()], ["TCRMP20240412_3D_MRS_T1.MP4"])
+        atlascatalog.write_needs_attention_report(run.needs_attention, walked_roots=[self.SOURCE])
+        with open(self.r.NEEDS_ATTENTION_CSV) as fh:
+            self.assertNotIn("driver_deposits", fh.read())
+
+    def test_a_merged_root_path_under_a_source_root_is_dropped(self):
+        run = self._catalog({"/volume5": _names(self.MERGED_SPEC)}, excluded=[self.MERGED])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["SHR_T1_2024_pbl"])
+        self.assertEqual(run.excluded_files, 1)
+        self.assertEqual(run.needs_attention, [])
+
+    def test_nothing_changes_when_no_exclusion_is_configured(self):
+        # Without the Shelf exclusion the deposited folders are still never
+        # read inside: each is a {SITE}_{T#}_3D processing folder (rule 1 of
+        # 2026-09-14), so every one of the five Shelf files is dropped after
+        # listing and counted as such, and the re-encoded MRS_T3 video inside
+        # frames/ makes no row.
+        listings = {self.SOURCE: _names(self.SHELF_SPEC)}
+        for excluded in ({}, {"excluded": None}, {"excluded": []}, {"excluded": ()}):
+            run = self._catalog(listings, **excluded)
+            self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"], excluded)
+            self.assertEqual(run.excluded_files, 0, excluded)
+            self.assertEqual(run.processing_files, self.SHELF_FILES, excluded)
+            self.assertEqual(run.needs_attention, [], excluded)
+            self.assertEqual(run.listed_files, self.SHELF_FILES + 1, excluded)
+        self.assertNotIn("-path", atlascatalog._find_argv(self.SOURCE))
+        self.assertNotIn("-path", atlascatalog._find_argv(self.SOURCE, ()))
+
+    def test_exclusion_is_by_path_segment_not_by_prefix(self):
+        listing = _names("""
+            TCRMP_2024Annual/TCRMP20240412_3D_MRS_T1.MP4
+            driver_deposits_old/TCRMP20240412_3D_MRS_T2.MP4
+            driver_deposits/TCRMP20240412_3D_MRS_T3.MP4
+        """)
+        # /volume6/Archive8 is not an ancestor of /volume6/Archive8_12TB/...
+        run = self._catalog({self.SOURCE: listing}, excluded=["/volume6/Archive8"])
+        self.assertEqual(len(run.rows), 3)
+        self.assertEqual(run.excluded_files, 0)
+        self.assertNotIn("-path", atlascatalog._find_argv(self.SOURCE, ["/volume6/Archive8"]))
+        # driver_deposits_old is not under driver_deposits; driver_deposits is.
+        run = self._catalog({self.SOURCE: listing}, excluded=[self.SHELF])
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), ["MRS_T1_2024_pbl", "MRS_T2_2024_pbl"])
+        self.assertEqual(run.excluded_files, 1)
+        self.assertEqual(atlascatalog._excluded_ancestor("/volume6/Archive8_12TB/x", ["/volume6/Archive8"]), None)
+        self.assertEqual(atlascatalog._excluded_ancestor(self.SHELF + "/x", [self.SHELF]), self.SHELF)
+        self.assertEqual(atlascatalog._excluded_ancestor(self.SHELF, [self.SHELF]), self.SHELF)
+        self.assertEqual(atlascatalog._excluded_ancestor(self.SHELF + "//x/", [self.SHELF + "/"]), self.SHELF)
+
+    def test_a_host_prefix_is_stripped_before_comparing(self):
+        run = self._catalog({self.SOURCE: _names(self.SHELF_SPEC)}, excluded=[f"{HOST}:{self.SHELF}"])
+        self.assertEqual(run.excluded_files, self.SHELF_FILES)
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        cfg = {"merged_root": f"{HOST}:{self.MERGED}/", "defaults": {"shelf_root": f"driver_svc@{HOST}:{self.SHELF}"}}
+        self.assertEqual(atlascatalog.excluded_roots(cfg), [self.SHELF, self.MERGED])
+        self.assertEqual(atlascatalog._strip_host("/volume6/odd:name/x"), "/volume6/odd:name/x")
+
+    def test_a_hundred_thousand_shelf_entries_are_dropped_in_bounded_time(self):
+        entries = [("TCRMP_2024Annual/TCRMP20240412_3D_MRS_T1.MP4", GB)]
+        entries += [(f"driver_deposits/deposit_{i % 4}/FLC_T3_3D/frames/frame_{i:06d}.jpg", 100) for i in range(100_000)]
+        started = time.monotonic()
+        run = self._catalog({self.SOURCE: entries}, dry_run=True, excluded=[self.SHELF, self.MERGED])
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 10.0, f"100,000 shelf files took {elapsed:.1f}s")
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        self.assertEqual(run.excluded_files, 100_000)
+        self.assertEqual(run.needs_attention, [])
+
+    # --- layer one: the find prunes the excluded paths on the NAS ----------
+
+    def test_find_argv_carries_prune_terms_only_for_excluded_paths_under_that_root(self):
+        argv = atlascatalog._find_argv(self.SOURCE, [self.SHELF, self.MERGED])
+        self.assertEqual(argv[:4], ["find", self.SOURCE, "-mindepth", "1"])
+        self.assertEqual(argv[4:], ["(", "-name", "@*", "-o", "-name", "#recycle", "-o", *atlascatalog.PROCESSING_PRUNE_TERMS,
+                                    "-o", "-path", self.SHELF, ")", "-prune", "-o", "-type", "f", "-printf", r"%s\0%P\0"])
+        self.assertNotIn(self.MERGED, argv)
+        other = "/volume4/Archive6_16TB"
+        self.assertNotIn("-path", atlascatalog._find_argv(other, [self.SHELF, self.MERGED]))
+        # The root itself is never a prune term: a root under an excluded path is refused before any find.
+        self.assertNotIn("-path", atlascatalog._find_argv(self.SHELF, [self.SHELF]))
+        # A root written with a trailing slash still yields the path find prints.
+        self.assertIn(self.SHELF, atlascatalog._find_argv(self.SOURCE + "/", [self.SHELF]))
+        # Two excluded paths under one root are both pruned.
+        both = atlascatalog._find_argv("/volume6", [self.SHELF, "/volume6/scratch", self.MERGED])
+        self.assertEqual(both.count("-path"), 2)
+        self.assertIn("/volume6/scratch", both)
+
+    def test_list_root_passes_the_prune_terms_to_the_nas(self):
+        seen = {}
+
+        def runner(argv, timeout=60):
+            seen["argv"] = argv
+            return (0, "", "")
+
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key", runner=runner)
+        self.assertEqual(atlascatalog.list_root(ssh, self.SOURCE, excluded=[self.SHELF, self.MERGED]), [])
+        self.assertEqual(seen["argv"][seen["argv"].index("-path"):][:2], ["-path", self.SHELF])
+        self.assertEqual(atlascatalog.list_root(ssh, self.SOURCE), [])
+        self.assertNotIn("-path", seen["argv"])
+
+    def test_find_argv_escapes_glob_characters_in_an_excluded_path(self):
+        argv = atlascatalog._find_argv("/v", ["/v/a[1]*?", "/v/back\\slash"])
+        self.assertIn(r"/v/a\[1]\*\?", argv)
+        self.assertIn("/v/back\\\\slash", argv)
+        self.assertNotIn("/v/a[1]*?", argv)
+
+    def test_the_find_prune_alone_keeps_the_shelf_off_the_nas(self):
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key",
+                               runner=self._pruning_runner({self.SOURCE: _names(self.SHELF_SPEC)}))
+        run = atlascatalog.catalog([self.SOURCE], ssh, excluded=[self.SHELF, self.MERGED])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        self.assertEqual(run.listed_files, 1, "the NAS never listed the Shelf")
+        self.assertEqual(run.excluded_files, 0, "layer two had nothing left to drop")
+        self.assertEqual(run.needs_attention, [])
+
+    # --- a root at or under an excluded path ---------------------------------
+
+    def test_a_root_at_or_under_an_excluded_path_is_reported_not_listed(self):
+        seen = []
+
+        def runner(argv, timeout=60):
+            seen.append(argv[1])
+            return (0, "", "")
+
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key", runner=runner)
+        good = "/volume4/Archive6_16TB"
+        bad = [self.SHELF, self.SHELF + "/TCRMP_11sep26_LO_MRS1+FLC3_23ann-25pbl", self.MERGED + "/2025_pbl"]
+        run = atlascatalog.catalog(bad + [good], ssh, excluded=[self.SHELF, self.MERGED])
+        self.assertEqual(seen, [good], "an excluded root must never reach the NAS")
+        self.assertEqual(run.roots_listed, 1)
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.EXCLUDED_ROOT_REASON] * 3)
+        self.assertEqual([i["root"] for i in run.needs_attention], bad)
+        self.assertEqual([i["path"] for i in run.needs_attention], bad)
+        for item, covering in zip(run.needs_attention, (self.SHELF, self.SHELF, self.MERGED)):
+            self.assertIn(covering, item["detail"])
+        self.assertNotIn(atlascatalog.UNMOUNTED_REASON, [i["reason"] for i in run.needs_attention])
+        rows, items = atlascatalog.catalog_roots([self.SHELF], ssh, excluded=[self.SHELF])
+        self.assertEqual((rows, [i["reason"] for i in items]), ([], [atlascatalog.EXCLUDED_ROOT_REASON]))
+
+    def test_list_root_refuses_an_excluded_root(self):
+        ssh = self._ssh({self.SHELF: _names("TCRMP20240412_3D_MRS_T1.MP4")})
+        for root in (self.SHELF, self.SHELF + "/", self.SHELF + "/TCRMP_11sep26_LO"):
+            with self.assertRaises(ValueError) as ctx:
+                atlascatalog.list_root(ssh, root, excluded=[self.SHELF])
+            self.assertIn(self.SHELF, str(ctx.exception))
+            self.assertIn(root, str(ctx.exception))
+        self.assertEqual(len(atlascatalog.list_root(ssh, self.SHELF)), 1, "no exclusion, no refusal")
+
+    # --- reading nas.yaml -------------------------------------------------------
+
+    def test_excluded_roots_reads_both_keys_and_tolerates_missing_ones(self):
+        self.assertEqual(atlascatalog.excluded_roots({}), [])
+        self.assertEqual(atlascatalog.excluded_roots({"defaults": {}}), [])
+        self.assertEqual(atlascatalog.excluded_roots({"defaults": None}), [])
+        self.assertEqual(atlascatalog.excluded_roots({"defaults": {"shelf_root": ""}, "merged_root": None}), [])
+        self.assertEqual(atlascatalog.excluded_roots({"merged_root": self.MERGED}), [self.MERGED])
+        self.assertEqual(atlascatalog.excluded_roots({"defaults": {"shelf_root": self.SHELF + "/"}}), [self.SHELF])
+        self.assertEqual(atlascatalog.excluded_roots({"defaults": {"shelf_root": self.SHELF}, "merged_root": self.MERGED}),
+                         [self.SHELF, self.MERGED])
+        self.assertEqual(atlascatalog.excluded_roots({"defaults": {"shelf_root": self.SHELF}, "merged_root": self.SHELF}),
+                         [self.SHELF])
+
+    def test_excluded_roots_reads_the_carousel_config_as_deployed(self):
+        if not os.path.exists(atlascatalog.DEFAULT_NAS_CONFIG):
+            self.skipTest(f"no carousel config at {atlascatalog.DEFAULT_NAS_CONFIG}")
+        cfg = atlascatalog.load_nas_config(atlascatalog.DEFAULT_NAS_CONFIG)
+        excluded = atlascatalog.excluded_roots(cfg)
+        self.assertEqual(excluded, [cfg["defaults"]["shelf_root"], cfg["merged_root"]])
+        # The reason this rule exists: the Shelf sits inside a source root.
+        self.assertIsNotNone(atlascatalog._excluded_ancestor(cfg["defaults"]["shelf_root"], cfg["source_roots"]))
+
+    def test_excluded_roots_refuses_a_bad_value_naming_the_key(self):
+        with self.assertRaises(TypeError):
+            atlascatalog.excluded_roots(["/x"])
+        for bad, key in (({"merged_root": 3}, "merged_root"), ({"defaults": {"shelf_root": ["/x"]}}, "defaults.shelf_root"),
+                         ({"defaults": "/x"}, "defaults")):
+            with self.assertRaises(TypeError) as ctx:
+                atlascatalog.excluded_roots(bad)
+            self.assertIn(key, str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            atlascatalog.excluded_roots({"merged_root": "relative/path"})
+        self.assertIn("merged_root", str(ctx.exception))
+
+    def test_catalog_refuses_a_malformed_excluded_parameter_before_listing(self):
+        called = []
+
+        def runner(argv, timeout=60):
+            called.append(argv)
+            return (0, "", "")
+
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key", runner=runner)
+        for bad, error in ((self.SHELF, TypeError), ([3], TypeError), (["relative"], ValueError), ([""], ValueError),
+                           ([f"{HOST}:relative"], ValueError)):
+            with self.assertRaises(error, msg=repr(bad)):
+                atlascatalog.catalog([ROOT_2024], ssh, excluded=bad)
+        self.assertEqual(called, [])
+
+    # --- the command line ---------------------------------------------------------
+
+    def test_main_dry_run_wires_shelf_root_and_merged_root_from_nas_yaml(self):
+        cfg = self._write_config_with_exclusions([self.SOURCE, "/volume5"])
+        listings = {self.SOURCE: _names(self.SHELF_SPEC), "/volume5": _names(self.MERGED_SPEC)}
+        output = self._main(["--nas-config", cfg, "--dry-run"], listings)
+        self.assertIn(f"never walked: {self.SHELF}, {self.MERGED}", output)
+        self.assertIn("MRS_T1_2024_pbl", output)
+        self.assertIn("SHR_T1_2024_pbl", output)
+        self.assertNotIn("MRS_T2_2024_pbl", output, "the merged-root video must not become a row")
+        self.assertNotIn("MRS_T3_2023ann", output, "the deposited video must not become a row")
+        self.assertNotIn("driver_deposits/", output, "no listed deposit path may be printed")
+        for line in ("rows: 2", "needs attention: 0", f"excluded after listing: {self.SHELF_FILES + 1} files",
+                     "Step 1 complete", "DRY RUN: needs-attention report not written"):
+            self.assertIn(line, output, output)
+        self.assertEqual(self.r.load(), [])
+        self.assertFalse(os.path.exists(self.r.NEEDS_ATTENTION_CSV))
+
+    def test_main_reports_a_root_under_the_shelf_instead_of_listing_it(self):
+        cfg = self._write_config_with_exclusions([self.SOURCE])
+        output = self._main(["--nas-config", cfg, "--dry-run", "--root", self.SHELF], {})
+        self.assertIn(atlascatalog.EXCLUDED_ROOT_REASON, output)
+        self.assertNotIn(atlascatalog.UNMOUNTED_REASON, output, "the NAS was never asked")
+        self.assertIn("rows: 0", output)
+        self.assertIn("needs attention: 1", output)
+
+    def test_main_real_run_replaces_the_shelf_lines_of_an_earlier_report(self):
+        # The report of 2026-09-14 held 61,216 Shelf lines under this root; a
+        # real run over the root replaces them with this run's findings.
+        atlascatalog.write_needs_attention_report([
+            {"root": self.SOURCE, "path": f"{self.SHELF}/old/frame.jpg", "reason": atlascatalog.BAD_NAME_REASON, "detail": ""},
+            {"root": "/volume2/Archive9_10TB", "path": "/volume2/Archive9_10TB/stays.MOV",
+             "reason": atlascatalog.BAD_NAME_REASON, "detail": ""},
+        ])
+        cfg = self._write_config_with_exclusions([self.SOURCE])
+        output = self._main(["--nas-config", cfg], {self.SOURCE: _names(self.SHELF_SPEC)})
+        self.assertIn("Step 2 complete", output)
+        self.assertIn(f"excluded after listing: {self.SHELF_FILES} files", output)
+        self.assertEqual([r["path"] for r in self.r.needs_attention()], ["/volume2/Archive9_10TB/stays.MOV"])
+        self.assertEqual([r["readable_id"] for r in self.r.load()], ["MRS_T1_2024_pbl"])
+        self.assertEqual(len(self._sidecar()), 1)
+
+
 class EditNoteTests(unittest.TestCase):
     """The one place the sidecar edit_note is built, in one order."""
 
@@ -683,9 +995,20 @@ class EditNoteTests(unittest.TestCase):
                                "proxy suffix dropped at rename; "
                                "name uses the demo token; catalogued as 3D")
 
+    def test_lone_part_note_takes_the_parts_slot(self):
+        note = atlascatalog._edit_note("", "2025-04-15", 1, True, kind="demo", lone_part=2)
+        self.assertEqual(note, "second recording on 2025-04-15, not counted in the row; see needs-attention; "
+                               "lone part 2; taken as the whole recording, prep renames it at pull time; "
+                               "proxy suffix dropped at rename; "
+                               "name uses the demo token; catalogued as 3D")
+
     def test_each_component_alone(self):
         self.assertEqual(atlascatalog._edit_note("", None, 0, False), "")
         self.assertEqual(atlascatalog._edit_note("", None, 1, False), "")
+        self.assertEqual(atlascatalog._edit_note("", None, 1, False, lone_part=1),
+                         atlascatalog.NOTE_LONE_PART.format(part=1))
+        self.assertEqual(atlascatalog._edit_note("", None, 1, False, lone_part=7), "lone part 7; taken as the "
+                         "whole recording, prep renames it at pull time")
         self.assertEqual(atlascatalog._edit_note("", None, 2, False), atlascatalog.NOTE_PARTS)
         self.assertEqual(atlascatalog._edit_note("", None, 0, True), atlascatalog.NOTE_PROXY)
         self.assertEqual(atlascatalog._edit_note("", None, 0, False, kind="3ddemo"), atlascatalog.NOTE_DEMO)
@@ -699,6 +1022,57 @@ class EditNoteTests(unittest.TestCase):
             atlascatalog._edit_note("", None, -1, False)
         with self.assertRaises(ValueError):
             atlascatalog._edit_note("", None, 0, False, kind="video")
+
+    def test_bad_lone_part_arguments_are_refused(self):
+        with self.assertRaises(TypeError):
+            atlascatalog._edit_note("", None, 1, False, lone_part="2")
+        with self.assertRaises(TypeError):
+            atlascatalog._edit_note("", None, 1, False, lone_part=True)
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 1, False, lone_part=0)
+        # A lone part and a part set cannot both be true of one group.
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 2, False, lone_part=1)
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 0, False, lone_part=1)
+
+    def test_folders_note_follows_the_parts_note(self):
+        self.assertEqual(atlascatalog._edit_note("", None, 2, False, folders=("TCRMP_2024_PBL", "TCRMP_2024_PBL/sub")),
+                         "parts grouped; physical merge at pull time; "
+                         "parts in 2 folders: TCRMP_2024_PBL; TCRMP_2024_PBL/sub")
+        self.assertEqual(atlascatalog._edit_note("", None, 3, False, folders=["b", "a", "c"]),
+                         "parts grouped; physical merge at pull time; parts in 3 folders: b; a; c")
+
+    def test_folders_note_sits_between_the_parts_note_and_the_proxy_note(self):
+        note = atlascatalog._edit_note("site label X applied from catalog_overrides.csv", "2024-02-16", 2, True,
+                                       kind="demo", folders=("a", "b"))
+        self.assertEqual(note, "site label X applied from catalog_overrides.csv; "
+                               "second recording on 2024-02-16, not counted in the row; see needs-attention; "
+                               "parts grouped; physical merge at pull time; "
+                               "parts in 2 folders: a; b; "
+                               "proxy suffix dropped at rename; "
+                               "name uses the demo token; catalogued as 3D")
+
+    def test_no_folders_means_no_folders_note(self):
+        self.assertEqual(atlascatalog._edit_note("", None, 2, False, folders=()), atlascatalog.NOTE_PARTS)
+        self.assertEqual(atlascatalog._edit_note("", None, 2, False, folders=None), atlascatalog.NOTE_PARTS)
+
+    def test_bad_folders_arguments_are_refused(self):
+        with self.assertRaises(TypeError):
+            atlascatalog._edit_note("", None, 2, False, folders="ab")
+        with self.assertRaises(TypeError):
+            atlascatalog._edit_note("", None, 2, False, folders=("a", 3))
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 2, False, folders=("a",))
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 2, False, folders=("a", ""))
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 2, False, folders=("a", "a"))
+        # Folders belong to a part set: a lone part or a whole file has none.
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 1, False, folders=("a", "b"))
+        with self.assertRaises(ValueError):
+            atlascatalog._edit_note("", None, 0, False, folders=("a", "b"))
 
     def test_override_note_with_and_without_text(self):
         self.assertEqual(atlascatalog._override_note("LBHLBPFIX1", "why"),
@@ -837,6 +1211,573 @@ class ClassificationTests(_CatalogCase):
         """)})
         self.assertEqual(sorted(r["readable_id"] for r in run.rows), ["MRS_T1_2024_pbl", "MRS_T2_2024_pbl"])
         self.assertEqual(run.needs_attention, [])
+
+
+class LonePartTests(_CatalogCase):
+    """A lone part is the whole recording (Lauren, 2026-09-11 13:31 AST: "if
+    that's it then that's it"). The archive's own case is Meri Shoal
+    transect 3, 2023 annual, whose only readable file is part1 (its sibling
+    "part2?" cannot be parsed and is never pulled); the 2026-09-08 refusal of
+    a lone part paused four transects for that one file. A set of two or
+    more parts must still run 1 to N, and a part beside a whole file is
+    still the canonical conflict."""
+
+    ROOT_2023 = "/volume2/Archive9_10TB/encoded/TCRMP_2023Annual"
+    MRS_T3_PART1 = "TCRMP20231207_demo_MRS_T3_part1.MP4"
+
+    def test_a_lone_part_1_is_the_row_with_its_number_and_the_lone_part_note(self):
+        run = self._catalog({self.ROOT_2023: _names(f"{self.MRS_T3_PART1} 2273372899")}, variants=("demo",))
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T3_2023ann"])
+        row = self.r.get("MRS_T3_2023ann")
+        self.assertEqual(row["original_videos"], self.MRS_T3_PART1)
+        self.assertEqual(row["video_size_gb"], "2.273")
+        files = self._sidecar("MRS_T3_2023ann")
+        self.assertEqual([(f["file_name"], f["part"], f["in_row"]) for f in files],
+                         [(self.MRS_T3_PART1, "1", "true")])
+        self.assertEqual(files[0]["edit_note"],
+                         f"{atlascatalog.NOTE_LONE_PART.format(part=1)}; {atlascatalog.NOTE_DEMO}")
+
+    def test_a_lone_part_2_is_the_row_and_the_note_names_part_2(self):
+        run = self._catalog({ROOT_2024: _names("TCRMP20240412_3D_MRS_T1_2.MP4 1500000000")})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        self.assertEqual(self.r.get("MRS_T1_2024_pbl")["original_videos"], "TCRMP20240412_3D_MRS_T1_2.MP4")
+        files = self._sidecar("MRS_T1_2024_pbl")
+        self.assertEqual([(f["part"], f["in_row"]) for f in files], [("2", "true")])
+        self.assertIn("lone part 2", files[0]["edit_note"])
+        self.assertEqual(files[0]["edit_note"], atlascatalog.NOTE_LONE_PART.format(part=2))
+
+    def test_a_lone_pt_spelled_part_is_the_row_too(self):
+        run = self._catalog({ROOT_2025: _names("TCRMP20250110_3D_BID_T2_pt3.MP4")})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["BID_T2_2025_pbl"])
+        self.assertEqual(self._sidecar("BID_T2_2025_pbl")[0]["edit_note"], atlascatalog.NOTE_LONE_PART.format(part=3))
+
+    def test_two_parts_with_a_gap_stay_incomplete(self):
+        run = self._catalog({ROOT_2024: _names("""
+            TCRMP20240412_3D_MRS_T1_1.MP4
+            TCRMP20240412_3D_MRS_T1_3.MP4
+        """)})
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.INCOMPLETE_PARTS_REASON])
+        self.assertIn("part numbers found: 1, 3", run.needs_attention[0]["detail"])
+        self.assertEqual(self.r.load(), [])
+        self.assertEqual(self._sidecar(), [])
+
+    def test_a_repeated_part_number_stays_incomplete(self):
+        # The same number written two ways is two files claiming one slot.
+        run = self._catalog({ROOT_2024: _names("""
+            TCRMP20240412_3D_MRS_T1_1.MP4
+            TCRMP20240412_3D_MRS_T1_part1.MP4
+        """)})
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.INCOMPLETE_PARTS_REASON])
+        self.assertIn("part numbers found: 1, 1", run.needs_attention[0]["detail"])
+
+    def test_a_set_starting_above_one_stays_incomplete(self):
+        run = self._catalog({ROOT_2024: _names("""
+            TCRMP20240412_3D_MRS_T1_2.MP4
+            TCRMP20240412_3D_MRS_T1_3.MP4
+        """)})
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.INCOMPLETE_PARTS_REASON])
+
+    def test_a_lone_part_beside_a_whole_file_stays_the_canonical_conflict(self):
+        run = self._catalog({self.ROOT_2023: _names(f"""
+            {self.MRS_T3_PART1}
+            TCRMP20231207_demo_MRS_T3.MP4
+        """)}, variants=("demo",))
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.CANONICAL_CONFLICT_REASON])
+        self.assertEqual(self.r.load(), [])
+        self.assertEqual(self._sidecar(), [])
+
+    def test_a_lone_part_beside_a_proxy_stays_the_canonical_conflict(self):
+        run = self._catalog({ROOT_2024: _names("""
+            TCRMP20240412_3D_MRS_T1_2.MP4
+            TCRMP20240412_3D_MRS_T1_Proxy.MP4
+        """)})
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.CANONICAL_CONFLICT_REASON])
+
+    def test_a_lone_part_as_a_later_take_keeps_its_note_out_of_the_row(self):
+        run = self._catalog({ROOT_2024: _names("""
+            dirA/TCRMP20240412_3D_MRS_T1.MP4
+            dirB/TCRMP20240413_3D_MRS_T1_2.MP4
+        """)})
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        self.assertEqual(run.rows[0]["path"], f"{ROOT_2024}/dirA")
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.SECOND_DATE_REASON])
+        later = [f for f in self._sidecar("MRS_T1_2024_pbl") if f["file_name"].endswith("_2.MP4")]
+        self.assertEqual([(f["part"], f["in_row"]) for f in later], [("2", "false")])
+        self.assertEqual(later[0]["edit_note"],
+                         f"{atlascatalog.NOTE_SECOND.format(date='2024-04-13')}; "
+                         f"{atlascatalog.NOTE_LONE_PART.format(part=2)}")
+
+    def test_a_lone_part_rerun_is_byte_identical(self):
+        listings = {ROOT_2024: _names("TCRMP20240412_3D_MRS_T1_2.MP4")}
+        self._catalog(listings)
+        with open(self.r.REGISTRY_CSV, "rb") as fh:
+            first = fh.read()
+        self._catalog(listings)
+        with open(self.r.REGISTRY_CSV, "rb") as fh:
+            second = fh.read()
+        self.assertEqual(first, second)
+
+
+class CrossFolderPartsTests(_CatalogCase):
+    """A recording whose parts sit in more than one folder under one season
+    root is one recording (Lauren, 2026-09-14: "build it"). The archive's
+    own case is Fish Bay transects 1 to 3 of 2024-02-16, with part 1 in
+    /volume2/Archive9_10TB/encoded/TCRMP_2024_PBL and part 2 in its subfolder
+    TCRMP2024_postbl_3D_DemoVideos. The set must be complete across the
+    folders (every member part-numbered, numbers exactly 1 to N, no repeat,
+    no whole file, no proxy) and the folders must be one folder and the
+    folders inside it (the folder of the shallowest part holds or contains
+    every other part), which keeps the join inside one season folder even
+    though the default run walks whole volumes. The row's video_location
+    is the folder of part 1; every sidecar line carries its own folder and
+    the folders note, each folder spelled from the top folder's own name so
+    the note reads the same whichever root was walked. Every other shape
+    that spans folders stays refused as before."""
+
+    VOLUME = "/volume2/Archive9_10TB"
+    SEASON = "TCRMP_2024_PBL"
+    ROOT = f"{VOLUME}/encoded/{SEASON}"
+    SUB = "TCRMP2024_postbl_3D_DemoVideos"
+    # How the folders note spells the subfolder: from the season folder's name.
+    SUB_LABEL = f"{SEASON}/{SUB}"
+    PART1 = "TCRMP20240216_3D_FSB_T1_1.MP4"
+    PART2 = "TCRMP20240216_3D_FSB_T1_2.MP4"
+
+    def _folders_note(self, *folders):
+        return atlascatalog.NOTE_PARTS_IN_FOLDERS.format(count=len(folders),
+                                                         folders=atlascatalog.DETAIL_JOINER.join(folders))
+
+    def test_the_fish_bay_shape_is_one_row_in_the_season_folder(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1} 1000000000
+            {self.SUB}/{self.PART2} 1500000000
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["FSB_T1_2024_pbl"])
+        self.assertEqual(run.rows[0]["path"], self.ROOT)
+        row = self.r.get("FSB_T1_2024_pbl")
+        self.assertEqual(row["video_location"], f"{HOST}:{self.ROOT}")
+        self.assertEqual(row["original_videos"], f"{self.PART1};{self.PART2}")
+        self.assertEqual(row["video_size_gb"], "2.5")
+        files = {f["file_name"]: f for f in self._sidecar("FSB_T1_2024_pbl")}
+        self.assertEqual(len(files), 2)
+        self.assertEqual(files[self.PART1]["nas_path"], f"{HOST}:{self.ROOT}/{self.PART1}")
+        self.assertEqual(files[self.PART2]["nas_path"], f"{HOST}:{self.ROOT}/{self.SUB}/{self.PART2}")
+        self.assertEqual([(files[n]["part"], files[n]["in_row"]) for n in (self.PART1, self.PART2)],
+                         [("1", "true"), ("2", "true")])
+        expected = f"{atlascatalog.NOTE_PARTS}; {self._folders_note(self.SEASON, self.SUB_LABEL)}"
+        self.assertEqual(files[self.PART1]["edit_note"], expected)
+        self.assertEqual(files[self.PART2]["edit_note"], expected)
+        self.assertEqual(expected, "parts grouped; physical merge at pull time; "
+                                   "parts in 2 folders: TCRMP_2024_PBL; TCRMP_2024_PBL/TCRMP2024_postbl_3D_DemoVideos")
+
+    def test_the_reverse_shape_puts_video_location_in_the_subfolder(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.SUB}/{self.PART1}
+            {self.PART2}
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.rows[0]["path"], f"{self.ROOT}/{self.SUB}")
+        row = self.r.get("FSB_T1_2024_pbl")
+        self.assertEqual(row["video_location"], f"{HOST}:{self.ROOT}/{self.SUB}")
+        self.assertEqual(row["original_videos"], f"{self.PART1};{self.PART2}")
+        files = {f["file_name"]: f for f in self._sidecar("FSB_T1_2024_pbl")}
+        self.assertEqual(files[self.PART1]["nas_path"], f"{HOST}:{self.ROOT}/{self.SUB}/{self.PART1}")
+        self.assertEqual(files[self.PART2]["nas_path"], f"{HOST}:{self.ROOT}/{self.PART2}")
+        # The folders are listed in part order: the folder of part 1 first.
+        self.assertTrue(files[self.PART2]["edit_note"].endswith(
+            self._folders_note(self.SUB_LABEL, self.SEASON)))
+
+    def test_three_folders_join_in_part_order(self):
+        # Part 2 sits in the season folder, parts 1 and 3 in two of its
+        # subfolders: one row at part 1's folder, the folders named in part
+        # order from the season folder's own name.
+        run = self._catalog({ROOT_2024: _names("""
+            c/TCRMP20240412_3D_MRS_T1_3.MP4 3000000000
+            TCRMP20240412_3D_MRS_T1_2.MP4 2000000000
+            b/TCRMP20240412_3D_MRS_T1_1.MP4 1000000000
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        self.assertEqual(run.rows[0]["path"], f"{ROOT_2024}/b")
+        self.assertEqual([f["nas_path"] for f in run.rows[0]["files"]], [
+            f"{HOST}:{ROOT_2024}/b/TCRMP20240412_3D_MRS_T1_1.MP4",
+            f"{HOST}:{ROOT_2024}/TCRMP20240412_3D_MRS_T1_2.MP4",
+            f"{HOST}:{ROOT_2024}/c/TCRMP20240412_3D_MRS_T1_3.MP4",
+        ])
+        row = self.r.get("MRS_T1_2024_pbl")
+        self.assertEqual(row["video_location"], f"{HOST}:{ROOT_2024}/b")
+        self.assertEqual(row["original_videos"], "TCRMP20240412_3D_MRS_T1_1.MP4;"
+                                                 "TCRMP20240412_3D_MRS_T1_2.MP4;TCRMP20240412_3D_MRS_T1_3.MP4")
+        self.assertEqual(row["video_size_gb"], "6.0")
+        notes = {f["edit_note"] for f in self._sidecar("MRS_T1_2024_pbl")}
+        self.assertEqual(notes, {f"{atlascatalog.NOTE_PARTS}; "
+                                 f"{self._folders_note('2024_annual/b', '2024_annual', '2024_annual/c')}"})
+
+    def test_a_deeper_subfolder_is_named_from_the_season_folder(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/deeper/{self.PART2}
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(self.r.get("FSB_T1_2024_pbl")["video_location"], f"{HOST}:{self.ROOT}")
+        notes = {f["edit_note"] for f in self._sidecar("FSB_T1_2024_pbl")}
+        self.assertEqual(notes, {f"{atlascatalog.NOTE_PARTS}; "
+                                 f"{self._folders_note(self.SEASON, f'{self.SUB_LABEL}/deeper')}"})
+
+    def test_the_row_reads_the_same_walked_from_the_volume_or_the_season_folder(self):
+        # The default run walks whole volumes (source_roots names
+        # /volume2/Archive9_10TB); a --root names one season folder. The
+        # same files must give the same row either way: the same
+        # video_location, the same paths, the same note, so nothing the
+        # ATLAS shows depends on how the catalog was invoked.
+        from_season = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/{self.PART2}
+        """)}, dry_run=True)
+        prefix = posixpath.relpath(self.ROOT, self.VOLUME)
+        from_volume = self._catalog({self.VOLUME: _names(f"""
+            {prefix}/{self.PART1}
+            {prefix}/{self.SUB}/{self.PART2}
+        """)}, dry_run=True)
+        for run in (from_season, from_volume):
+            self.assertEqual(run.needs_attention, [])
+            self.assertEqual(len(run.rows), 1)
+        self.assertEqual(from_volume.rows[0]["fields"], from_season.rows[0]["fields"])
+        self.assertEqual(from_volume.rows[0]["files"], from_season.rows[0]["files"])
+        self.assertEqual(from_volume.rows[0]["fields"]["video_location"], f"{HOST}:{self.ROOT}")
+        self.assertEqual(from_volume.rows[0]["files"][1]["edit_note"],
+                         "parts grouped; physical merge at pull time; "
+                         "parts in 2 folders: TCRMP_2024_PBL; TCRMP_2024_PBL/TCRMP2024_postbl_3D_DemoVideos")
+
+    def test_two_season_folders_on_one_volume_stay_refused(self):
+        # The default run walks a whole volume. A _1 in one season folder and
+        # a _2 in another folder of that volume complete each other by
+        # number, but the folders are not one folder and the folders inside
+        # it: refused, never joined by guess.
+        run = self._catalog({self.VOLUME: _names(f"""
+            encoded/{self.SEASON}/{self.PART1}
+            backup/{self.SEASON}_old/{self.PART2}
+        """)})
+        self._assert_refused(run)
+        item = run.needs_attention[0]
+        self.assertEqual(item["path"], f"{self.VOLUME}/backup/{self.SEASON}_old; {self.VOLUME}/encoded/{self.SEASON}")
+        self.assertIn(atlascatalog.NOT_NESTED_DETAIL, item["detail"])
+
+    def test_sibling_subfolders_with_nothing_above_them_stay_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            a/{self.PART1}
+            b/{self.PART2}
+        """)})
+        self._assert_refused(run)
+        self.assertIn(atlascatalog.NOT_NESTED_DETAIL, run.needs_attention[0]["detail"])
+
+    def test_a_folder_whose_name_merely_starts_like_the_season_folder_is_not_inside_it(self):
+        run = self._catalog({self.VOLUME: _names(f"""
+            encoded/{self.SEASON}/{self.PART1}
+            encoded/{self.SEASON}_old/{self.PART2}
+        """)})
+        self._assert_refused(run)
+
+    def test_an_incomplete_cross_folder_set_is_refused_without_the_nested_clause(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/TCRMP20240216_3D_FSB_T1_3.MP4
+        """)})
+        self._assert_refused(run)
+        self.assertNotIn(atlascatalog.NOT_NESTED_DETAIL, run.needs_attention[0]["detail"])
+
+    def test_the_nested_folders_predicate(self):
+        def member(directory):
+            return {"dir": directory}
+        nested = [member("/v/season/sub"), member("/v/season"), member("/v/season/sub/deeper")]
+        self.assertEqual(atlascatalog._spanning_top(nested), ("v", "season"))
+        self.assertIsNone(atlascatalog._spanning_top([member("/v/a"), member("/v/b")]))
+        self.assertIsNone(atlascatalog._spanning_top([member("/v/season"), member("/v/season_old/sub")]),
+                          "a name prefix is not a folder")
+        self.assertEqual(atlascatalog._spanning_top([member("/v/season/"), member("/v/season//sub")]),
+                         ("v", "season"), "slashes are normalised before comparing")
+        self.assertEqual(atlascatalog._spanning_top([member("/v/season"), member("/v/season")]), ("v", "season"))
+        with self.assertRaises(ValueError):
+            atlascatalog._spanning_top([])
+
+    def test_two_parts_in_one_folder_and_the_third_in_another_join(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.PART2}
+            {self.SUB}/TCRMP20240216_3D_FSB_T1_3.MP4
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(self.r.get("FSB_T1_2024_pbl")["video_location"], f"{HOST}:{self.ROOT}")
+        files = self._sidecar("FSB_T1_2024_pbl")
+        self.assertEqual(len(files), 3)
+        self.assertEqual({f["edit_note"] for f in files},
+                         {f"{atlascatalog.NOTE_PARTS}; {self._folders_note(self.SEASON, self.SUB_LABEL)}"})
+
+    def test_mixed_part_spellings_across_folders_join(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            TCRMP20240216_3D_FSB_T1_part1.MP4
+            {self.SUB}/TCRMP20240216_3D_FSB_T1_pt2.MP4
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(self.r.get("FSB_T1_2024_pbl")["original_videos"],
+                         "TCRMP20240216_3D_FSB_T1_part1.MP4;TCRMP20240216_3D_FSB_T1_pt2.MP4")
+        self.assertEqual(self.r.get("FSB_T1_2024_pbl")["video_location"], f"{HOST}:{self.ROOT}")
+
+    def _assert_refused(self, run):
+        """The split refusal exactly as before: no row, no sidecar line, one line naming both folders."""
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.SPLIT_ACROSS_DIRS_REASON])
+        self.assertIn("found split across", run.needs_attention[0]["detail"])
+        self.assertEqual(self.r.load(), [])
+        self.assertEqual(self._sidecar(), [])
+
+    def test_a_whole_file_in_one_folder_beside_parts_in_another_stays_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            TCRMP20240216_3D_FSB_T1.MP4
+            {self.SUB}/{self.PART1}
+            {self.SUB}/{self.PART2}
+        """)})
+        self._assert_refused(run)
+        item = run.needs_attention[0]
+        self.assertEqual(item["path"], f"{self.ROOT}; {self.ROOT}/{self.SUB}")
+        self.assertIn(self.SUB, item["detail"])
+
+    def test_a_whole_file_beside_a_lone_part_in_another_folder_stays_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            TCRMP20240216_3D_FSB_T1.MP4
+            {self.SUB}/{self.PART1}
+        """)})
+        self._assert_refused(run)
+
+    def test_a_gapped_cross_folder_set_stays_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/TCRMP20240216_3D_FSB_T1_3.MP4
+        """)})
+        self._assert_refused(run)
+
+    def test_a_cross_folder_set_starting_above_one_stays_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART2}
+            {self.SUB}/TCRMP20240216_3D_FSB_T1_3.MP4
+        """)})
+        self._assert_refused(run)
+
+    def test_the_same_numbers_in_two_folders_stay_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.PART2}
+            {self.SUB}/{self.PART1}
+            {self.SUB}/{self.PART2}
+        """)})
+        self._assert_refused(run)
+
+    def test_one_number_written_two_ways_in_two_folders_stays_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/TCRMP20240216_3D_FSB_T1_part1.MP4
+        """)})
+        self._assert_refused(run)
+
+    def test_a_proxy_part_among_the_parts_stays_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/TCRMP20240216_3D_FSB_T1_2_Proxy.MP4
+        """)})
+        self._assert_refused(run)
+
+    def test_a_proxy_whole_file_beside_parts_in_another_folder_stays_refused(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            TCRMP20240216_3D_FSB_T1_Proxy.MP4
+            {self.SUB}/{self.PART1}
+            {self.SUB}/{self.PART2}
+        """)})
+        self._assert_refused(run)
+
+    def test_a_single_folder_set_is_unchanged(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.SUB}/{self.PART2}
+            {self.SUB}/{self.PART1}
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(self.r.get("FSB_T1_2024_pbl")["video_location"], f"{HOST}:{self.ROOT}/{self.SUB}")
+        files = self._sidecar("FSB_T1_2024_pbl")
+        self.assertEqual([(f["file_name"], f["part"], f["edit_note"]) for f in files], [
+            (self.PART1, "1", atlascatalog.NOTE_PARTS),
+            (self.PART2, "2", atlascatalog.NOTE_PARTS),
+        ])
+        self.assertTrue(all(f["nas_path"] == f"{HOST}:{self.ROOT}/{self.SUB}/{f['file_name']}" for f in files))
+
+    def test_the_lone_part_rule_is_unchanged(self):
+        # Two lone parts of two different transects in two folders: two rows,
+        # each the whole recording with its own lone-part note, no split.
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART2}
+            {self.SUB}/TCRMP20240216_3D_FSB_T2_1.MP4
+        """)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), ["FSB_T1_2024_pbl", "FSB_T2_2024_pbl"])
+        self.assertEqual(self._sidecar("FSB_T1_2024_pbl")[0]["edit_note"], atlascatalog.NOTE_LONE_PART.format(part=2))
+        self.assertEqual(self._sidecar("FSB_T2_2024_pbl")[0]["edit_note"], atlascatalog.NOTE_LONE_PART.format(part=1))
+
+    def test_an_override_on_one_part_takes_it_out_of_the_set_before_joining(self):
+        # The override changes part 2's identity before grouping, so nothing
+        # spans folders: two lone parts, two rows, no join.
+        overrides = {self.PART2: {"site": "FSBFIX", "note": "second take"}}
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/{self.PART2}
+        """)}, overrides=overrides)
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), ["FSBFIX_T1_2024_pbl", "FSB_T1_2024_pbl"])
+        self.assertIn("lone part 1", self._sidecar("FSB_T1_2024_pbl")[0]["edit_note"])
+
+    def test_a_cross_folder_set_as_a_later_take_is_recorded_out_of_the_row(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            earlier/TCRMP20240215_3D_FSB_T1.MP4
+            {self.PART1}
+            {self.SUB}/{self.PART2}
+        """)})
+        self.assertEqual([r["readable_id"] for r in run.rows], ["FSB_T1_2024_pbl"])
+        self.assertEqual(run.rows[0]["path"], f"{self.ROOT}/earlier")
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.SECOND_DATE_REASON])
+        self.assertEqual(run.needs_attention[0]["path"], self.ROOT, "the later take is reported at part 1's folder")
+        files = {f["file_name"]: f for f in self._sidecar("FSB_T1_2024_pbl")}
+        self.assertEqual(len(files), 3)
+        later = files[self.PART2]
+        self.assertEqual((later["part"], later["in_row"]), ("2", "false"))
+        self.assertEqual(later["nas_path"], f"{HOST}:{self.ROOT}/{self.SUB}/{self.PART2}")
+        self.assertEqual(later["edit_note"],
+                         f"{atlascatalog.NOTE_SECOND.format(date='2024-02-16')}; {atlascatalog.NOTE_PARTS}; "
+                         f"{self._folders_note(self.SEASON, self.SUB_LABEL)}")
+
+    def test_a_cross_folder_set_and_a_demo_token(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            TCRMP20240216_demo_FSB_T1_1.MP4
+            {self.SUB}/TCRMP20240216_demo_FSB_T1_2.MP4
+        """)}, variants=("demo",))
+        self.assertEqual(run.needs_attention, [])
+        notes = {f["edit_note"] for f in self._sidecar("FSB_T1_2024_pbl")}
+        self.assertEqual(notes, {f"{atlascatalog.NOTE_PARTS}; "
+                                 f"{self._folders_note(self.SEASON, self.SUB_LABEL)}; "
+                                 f"{atlascatalog.NOTE_DEMO}"})
+
+    def test_a_cross_folder_rerun_is_byte_identical(self):
+        listings = {self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/{self.PART2}
+        """)}
+        self._catalog(listings)
+        with open(self.r.REGISTRY_CSV, "rb") as fh:
+            first_rows = fh.read()
+        with open(self.r.SOURCE_FILES_CSV, "rb") as fh:
+            first_files = fh.read()
+        self._catalog(listings)
+        with open(self.r.REGISTRY_CSV, "rb") as fh:
+            self.assertEqual(fh.read(), first_rows)
+        with open(self.r.SOURCE_FILES_CSV, "rb") as fh:
+            self.assertEqual(fh.read(), first_files)
+
+    def test_a_dry_run_carries_each_file_on_its_own_path(self):
+        run = self._catalog({self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/{self.PART2}
+        """)}, dry_run=True)
+        self.assertEqual(run.rows[0]["path"], self.ROOT)
+        self.assertEqual([f["nas_path"] for f in run.rows[0]["files"]],
+                         [f"{HOST}:{self.ROOT}/{self.PART1}", f"{HOST}:{self.ROOT}/{self.SUB}/{self.PART2}"])
+        self.assertEqual(self.r.load(), [])
+
+    def test_a_season_folder_with_three_split_transects_and_one_whole_file(self):
+        # A shaped fixture, not the archive: three transects with part 1 in the
+        # season folder and part 2 in a subfolder, beside one whole file that
+        # is not split (the real Fish Bay 2024-02-16 files are two versions of
+        # each recording and were ruled on by hand): four rows, nothing to
+        # review, every split row in the season folder with both files on
+        # their own paths.
+        spec = "\n".join(f"TCRMP20240216_3D_FSB_T{n}_1.MP4\n{self.SUB}/TCRMP20240216_3D_FSB_T{n}_2.MP4"
+                         for n in (1, 2, 3)) + "\nTCRMP20240216_3D_FSB_T4.MP4"
+        run = self._catalog({self.ROOT: _names(spec)})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows),
+                         ["FSB_T1_2024_pbl", "FSB_T2_2024_pbl", "FSB_T3_2024_pbl", "FSB_T4_2024_pbl"])
+        rows = {r["readable_id"]: r for r in self.r.load()}
+        self.assertTrue(all(rows[f"FSB_T{n}_2024_pbl"]["video_location"] == f"{HOST}:{self.ROOT}" for n in (1, 2, 3, 4)))
+        sidecar = self._sidecar()
+        self.assertEqual(len(sidecar), 7)
+        self.assertEqual(sum(1 for f in sidecar if f["nas_path"].startswith(f"{HOST}:{self.ROOT}/{self.SUB}/")), 3)
+        self.assertEqual(sum(1 for f in sidecar if "parts in 2 folders" in f["edit_note"]), 6)
+        self.assertEqual(rows["FSB_T4_2024_pbl"]["original_videos"], "TCRMP20240216_3D_FSB_T4.MP4")
+
+    def test_the_command_line_dry_run_prints_the_joined_row_and_nothing_to_review(self):
+        # End to end through main() with the ssh listing faked: the printed
+        # table shows the row at the season folder and the run says nothing
+        # needs attention; a dry run writes nothing.
+        cfg_path = self._write_config(self.ROOT)
+        out = self._main(["--nas-config", cfg_path, "--dry-run"], {self.ROOT: _names(f"""
+            {self.PART1}
+            {self.SUB}/{self.PART2}
+        """)})
+        self.assertIn("FSB_T1_2024_pbl", out)
+        self.assertIn(f"{HOST}:{self.ROOT}  ", out)
+        self.assertIn(f"{self.PART1};{self.PART2}", out)
+        self.assertIn("No items need attention.", out)
+        self.assertIn("rows: 1", out)
+        self.assertIn("source files: 2 (2 in row)", out)
+        self.assertEqual(self.r.load(), [])
+
+    def test_hostile_folder_names_are_carried_verbatim(self):
+        # A folder with a space, one with the note's own joiner inside it,
+        # and one with a non-ASCII name: each is a real NAS folder name and
+        # reaches the sidecar unchanged, path and note alike.
+        folders = ["demo videos", "demo videos/a; b", "demo videos/café"]
+        # Explicit tuples: _names splits on whitespace, and a folder name with a space is the point here.
+        entries = [(f"{folders[n - 1]}/TCRMP20240216_3D_FSB_T1_{n}.MP4", GB) for n in (1, 2, 3)]
+        run = self._catalog({self.ROOT: entries})
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.rows[0]["path"], f"{self.ROOT}/demo videos")
+        files = self._sidecar("FSB_T1_2024_pbl")
+        self.assertEqual([f["nas_path"] for f in files],
+                         [f"{HOST}:{self.ROOT}/{folders[n - 1]}/TCRMP20240216_3D_FSB_T1_{n}.MP4" for n in (1, 2, 3)])
+        # No part sits in the season folder itself, so the top folder is
+        # "demo videos" (part 1's) and the note is spelled from its name.
+        expected = self._folders_note(*folders)
+        self.assertTrue(all(f["edit_note"].endswith(expected) for f in files), files[0]["edit_note"])
+
+    def test_many_sets_spanning_folders_are_all_joined(self):
+        # 300 transects, each with parts 1 to 3 spread over the season folder
+        # and two of its subfolders: every one a row, nothing to review, in
+        # well under a minute.
+        spec = "\n".join(f"{folder}TCRMP20240216_3D_FSB_T{t}_{n}.MP4"
+                         for t in range(1, 301) for n, folder in ((1, "f1/"), (2, ""), (3, "f3/")))
+        started = time.monotonic()
+        run = self._catalog({self.ROOT: _names(spec)}, dry_run=True)
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(len(run.rows), 300)
+        self.assertTrue(all(r["path"] == f"{self.ROOT}/f1" for r in run.rows), "part 1 sits in f1 for every set")
+        self.assertEqual(sum(len(r["files"]) for r in run.rows), 900)
+
+    def test_the_complete_set_predicate(self):
+        def member(name):
+            return {"name": name, "parsed": atlascatalog.naming3d.parse_video_name(name)}
+        complete = [member("TCRMP20240216_3D_FSB_T1_2.MP4"), member("TCRMP20240216_3D_FSB_T1_1.MP4")]
+        self.assertTrue(atlascatalog._is_complete_part_set(complete))
+        self.assertFalse(atlascatalog._is_complete_part_set([member("TCRMP20240216_3D_FSB_T1_1.MP4")]),
+                         "one part is not a set")
+        self.assertFalse(atlascatalog._is_complete_part_set(complete + [member("TCRMP20240216_3D_FSB_T1.MP4")]))
+        self.assertFalse(atlascatalog._is_complete_part_set(complete + [member("TCRMP20240216_3D_FSB_T1_3_Proxy.MP4")]))
+        self.assertFalse(atlascatalog._is_complete_part_set(complete + [member("TCRMP20240216_3D_FSB_T1_pt2.MP4")]))
+        self.assertFalse(atlascatalog._is_complete_part_set([]))
 
 
 class SameTimepointTests(_CatalogCase):
@@ -1108,12 +2049,19 @@ class VariantTests(_CatalogCase):
             TCRMP20240408_demo_GKT_EXTRA_T1_2.MP4
         """)
         run = self._catalog({self.ROOT_2024PBL: listing}, variants=("demo",), dry_run=True)
-        self.assertEqual([r["readable_id"] for r in run.rows], ["FSB_T1_2024_pbl"])
-        self.assertEqual(len(run.needs_attention), 6)
+        # SHR_T5 joins the rows because "_pt1" is a part spelling the archive
+        # really uses (2026-09-08). Only pt1 is in this listing, so the row it
+        # makes names a single part: a lone part is the whole recording
+        # (Lauren, 2026-09-11), prep renames it at pull time and step 0
+        # extracts from it, with the part number kept on the sidecar line.
+        self.assertEqual([r["readable_id"] for r in run.rows],
+                         ["FSB_T1_2024_pbl", "SHR_T5_2024_pbl"])
+        self.assertEqual(len(run.needs_attention), 5)
 
         run = self._catalog({self.ROOT_2024PBL: listing}, variants=("demo", "3ddemo"))
-        self.assertEqual(sorted(r["readable_id"] for r in run.rows), ["FLC_T3_2024_pbl", "FLC_T5_2024_pbl", "FSB_T1_2024_pbl"])
-        self.assertEqual(len(run.needs_attention), 3)
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows),
+                         ["FLC_T3_2024_pbl", "FLC_T5_2024_pbl", "FSB_T1_2024_pbl", "SHR_T5_2024_pbl"])
+        self.assertEqual(len(run.needs_attention), 2)
         row = self.r.get("FLC_T5_2024_pbl")
         self.assertEqual(row["original_videos"], "TCRMP20240215_3ddemo_FLC_T5_1.mp4;TCRMP20240215_3ddemo_FLC_T5_2.mp4")
         self.assertEqual(row["video_location"], f"{HOST}:{self.ROOT_2024PBL}/TCRMP2024_postbl_3D_DemoVideos")
@@ -1214,6 +2162,40 @@ class RunShapeTests(_CatalogCase):
         # An empty run rewrites the file to its header only.
         atlascatalog.write_needs_attention_report([])
         self.assertEqual(self.r.needs_attention(), [])
+
+    def test_a_run_over_one_root_keeps_another_root_s_findings(self):
+        # The names in this report are files no rule can read, so the report is
+        # the only record that they exist at all. A catalog run over the 2024
+        # spring season used to erase every finding from every other season, so
+        # reading the report showed nine problems where the archive held
+        # eighteen (2026-09-08).
+        other_root = "/volume4/Archive6_16TB/TCRMP_2024Annual"
+        atlascatalog.write_needs_attention_report([
+            {"root": ROOT_2025, "path": f"{ROOT_2025}/odd_one.MP4",
+             "reason": atlascatalog.BAD_NAME_REASON, "detail": ""},
+            {"root": other_root, "path": f"{other_root}/odd_two.MOV",
+             "reason": atlascatalog.BAD_NAME_REASON, "detail": ""},
+        ])
+        atlascatalog.write_needs_attention_report(
+            [{"root": ROOT_2025, "path": f"{ROOT_2025}/odd_three.MP4",
+              "reason": atlascatalog.BAD_NAME_REASON, "detail": ""}],
+            walked_roots=[ROOT_2025])
+        paths = sorted(r["path"] for r in self.r.needs_attention())
+        self.assertEqual(paths, sorted([f"{ROOT_2025}/odd_three.MP4", f"{other_root}/odd_two.MOV"]),
+                         "a run over one root erased another root's findings")
+
+    def test_walked_roots_replaces_only_those_roots(self):
+        other_root = "/volume4/Archive6_16TB/TCRMP_2024Annual"
+        atlascatalog.write_needs_attention_report([
+            {"root": ROOT_2025, "path": f"{ROOT_2025}/gone.MP4",
+             "reason": atlascatalog.BAD_NAME_REASON, "detail": ""},
+            {"root": other_root, "path": f"{other_root}/stays.MOV",
+             "reason": atlascatalog.BAD_NAME_REASON, "detail": ""},
+        ])
+        # This root was walked and came back clean: its old line goes.
+        atlascatalog.write_needs_attention_report([], walked_roots=[ROOT_2025])
+        paths = [r["path"] for r in self.r.needs_attention()]
+        self.assertEqual(paths, [f"{other_root}/stays.MOV"])
 
     def test_report_refuses_a_malformed_item(self):
         with self.assertRaises((TypeError, ValueError)):
@@ -1397,3 +2379,888 @@ class PrepToolsGroupingExtractionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExcludedPathTypoTests(unittest.TestCase):
+    def test_a_dot_dot_segment_in_an_excluded_path_is_refused_not_folded(self):
+        with self.assertRaises(ValueError) as ctx:
+            atlascatalog._check_excluded(["/volume6/Archive8_12TB/driver_deposits/.."])
+        self.assertIn("..", str(ctx.exception))
+
+
+class ProcessingFolderTests(_CatalogCase):
+    """Rule: the catalog never reads inside a processing folder.
+
+    On 2026-09-14 an old Voyager 1 project on Archive9,
+    /volume2/Archive9_10TB/TCRMP_2025_PBL/TCRMP_2025_PBL_01/processing/frames/<id>/,
+    made the dry run report 22 second recordings and would have moved 22
+    rows of 2025 spring onto frame folders: a copy inside frames/ parses
+    like its original and its volume sorts first. A directory named
+    processing or frames, one named {SITE}_{T#}_3D, or one ending
+    _3dprocessing is pruned in the find (directories only) and dropped after
+    listing, with a count; a root inside one is reported, never listed.
+    """
+
+    ARCHIVE9 = "/volume2/Archive9_10TB"
+    ARCHIVE2 = "/volume3/Archive2_12TB/TCRMP_2025_PBL/_encoded"
+    MRS_T1 = "TCRMP20250321_3D_MRS_T1_Proxy.MOV"
+    OLD_PROJECT = "TCRMP_2025_PBL/TCRMP_2025_PBL_01/processing"
+    ARCHIVE9_SPEC = f"""
+        {OLD_PROJECT}/frames/MRS_T1_2025_pbl/{MRS_T1} 97236222464
+        {OLD_PROJECT}/frames/MRS_T1_2025_pbl/TCRMP20250321_3D_MRS_T1_frame_000001.jpg 100
+        {OLD_PROJECT}/MRS_T1_2023_2025.psx 100
+    """
+    ARCHIVE9_FILES = 3
+
+    def _dir_pruning_runner(self, listings):
+        """A fake find that honours its -name and -iname terms on directory
+        names and its -path terms, as the NAS does."""
+        def runner(argv, timeout=60):
+            root = argv[1]
+            entries = listings.get(root)
+            if entries is None:
+                return (1, "", f"find: '{root}': No such file or directory")
+            names = [(argv[i], argv[i + 1]) for i, word in enumerate(argv) if word in ("-name", "-iname")]
+            paths = [argv[i + 1] for i, word in enumerate(argv) if word == "-path"]
+
+            def pruned(rel):
+                full = posixpath.join(root, rel)
+                if any(full == p or full.startswith(p + "/") for p in paths):
+                    return True
+                for segment in posixpath.dirname(rel).split("/"):
+                    for flag, pattern in names:
+                        if flag == "-name" and fnmatch.fnmatchcase(segment, pattern):
+                            return True
+                        if flag == "-iname" and fnmatch.fnmatchcase(segment.lower(), pattern.lower()):
+                            return True
+                return False
+
+            kept = [(rel, size) for rel, size in entries if not pruned(rel)]
+            return (0, "".join(f"{size}\0{rel}\0" for rel, size in kept), "")
+        return runner
+
+    def test_the_archive9_frames_folder_makes_no_row_and_no_second_recording_line(self):
+        run = self._catalog({self.ARCHIVE9: _names(self.ARCHIVE9_SPEC),
+                             self.ARCHIVE2: _names(f"TCRMP_2025_PBL_RAW_01/{self.MRS_T1} 97236222464")})
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2025_pbl"])
+        self.assertEqual(run.rows[0]["path"], f"{self.ARCHIVE2}/TCRMP_2025_PBL_RAW_01")
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.processing_files, self.ARCHIVE9_FILES)
+        self.assertEqual(run.listed_files, self.ARCHIVE9_FILES + 1)
+        self.assertEqual(run.excluded_files, 0)
+        self.assertEqual([f["nas_path"] for f in self._sidecar()],
+                         [f"{HOST}:{self.ARCHIVE2}/TCRMP_2025_PBL_RAW_01/{self.MRS_T1}"])
+
+    def test_a_transect_processing_folder_under_a_season_root_is_dropped(self):
+        run = self._catalog({ROOT_2024: _names("""
+            TCRMP20240412_3D_MRS_T1.MP4
+            MRS_T1_3D/frames/MRS_T1_2024_pbl/TCRMP20240412_3D_MRS_T1.MP4
+            MRS_T1_3D/MRS_T1_2024_2024.psx 100
+        """)})
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2024_pbl"])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.processing_files, 2)
+        self.assertEqual(len(self._sidecar()), 1)
+
+    def test_an_old_style_3dprocessing_folder_is_dropped(self):
+        run = self._catalog({ROOT_2024: _names("""
+            MRS_T1_2023ann_3dprocessing/frames/MRS_T1_2023ann/TCRMP20231207_3D_MRS_T1.MP4
+            MRS_T1_2023ann_3DPROCESSING/report.pdf 100
+        """)})
+        self.assertEqual(run.rows, [])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.processing_files, 2)
+
+    def test_the_processing_folder_predicate(self):
+        for name in ("processing", "Processing", "PROCESSING", "frames", "Frames", "MRS_T1_3D", "FLC_T10_3D",
+                     "MRS_T1_2023ann_3dprocessing", "x_3DPROCESSING"):
+            self.assertTrue(atlascatalog._is_processing_folder(name), name)
+        for name in ("", "processing2", "frames.bak", "mrs_t1_3d", "MRS_T1_3D_old", "TCRMP_2024_PBL",
+                     "TCRMP2024_postbl_3D_DemoVideos", "encoded", "3dprocessing", "frames\n", None):
+            self.assertFalse(atlascatalog._is_processing_folder(name), repr(name))
+
+    def test_find_argv_prunes_processing_folders_as_directories(self):
+        argv = atlascatalog._find_argv(ROOT_2024)
+        terms = atlascatalog.PROCESSING_PRUNE_TERMS
+        self.assertEqual(argv[4:], ["(", "-name", "@*", "-o", "-name", "#recycle", "-o", *terms, ")",
+                                    "-prune", "-o", "-type", "f", "-printf", r"%s\0%P\0"])
+        self.assertEqual(terms[:3], ["(", "-type", "d"])
+        for word in atlascatalog.PROCESSING_FOLDER_WORDS:
+            self.assertEqual(terms[terms.index(word) - 1], "-iname")
+        self.assertEqual(terms[terms.index("*" + atlascatalog.PROCESSING_FOLDER_SUFFIX) - 1], "-iname")
+        self.assertEqual(terms[terms.index(atlascatalog.PROCESSING_FOLDER_GLOB) - 1], "-name")
+        # The excluded-path terms follow the processing group inside the same prune.
+        with_shelf = atlascatalog._find_argv("/volume6", ["/volume6/driver_deposits"])
+        self.assertEqual(with_shelf[4:], ["(", "-name", "@*", "-o", "-name", "#recycle", "-o", *terms,
+                                          "-o", "-path", "/volume6/driver_deposits", ")",
+                                          "-prune", "-o", "-type", "f", "-printf", r"%s\0%P\0"])
+
+    def test_the_find_prune_alone_keeps_processing_folders_off_the_nas(self):
+        listings = {self.ARCHIVE9: _names(self.ARCHIVE9_SPEC + f"""
+            TCRMP_2025_PBL/TCRMP_2025_PBL_01/{self.MRS_T1} 97236222464
+            TCRMP_2025_PBL/MRS_T1_3D/frames/x/TCRMP20250321_3D_MRS_T1_Proxy.MOV
+            TCRMP_2025_PBL/MRS_T1_2025_pbl_3dprocessing/x/TCRMP20250321_3D_MRS_T1_Proxy.MOV
+            TCRMP_2025_PBL/Frames/TCRMP20250321_3D_MRS_T1_Proxy.MOV
+        """)}
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key", runner=self._dir_pruning_runner(listings))
+        run = atlascatalog.catalog([self.ARCHIVE9], ssh)
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2025_pbl"])
+        self.assertEqual(run.listed_files, 1, "the NAS never listed the processing folders")
+        self.assertEqual(run.processing_files, 0, "layer two had nothing left to drop")
+        self.assertEqual(run.needs_attention, [])
+
+    def test_a_root_inside_a_processing_folder_is_reported_not_listed(self):
+        seen = []
+
+        def runner(argv, timeout=60):
+            seen.append(argv[1])
+            return (0, "", "")
+
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key", runner=runner)
+        inside = f"{self.ARCHIVE9}/{self.OLD_PROJECT}/frames"
+        run = atlascatalog.catalog([inside, ROOT_2024, f"{self.ARCHIVE9}/x/MRS_T1_3D"], ssh)
+        self.assertEqual(seen, [ROOT_2024])
+        self.assertEqual([(i["root"], i["path"], i["reason"]) for i in run.needs_attention],
+                         [(inside, inside, atlascatalog.PROCESSING_ROOT_REASON),
+                          (f"{self.ARCHIVE9}/x/MRS_T1_3D",) * 2 + (atlascatalog.PROCESSING_ROOT_REASON,)])
+        self.assertIn("processing", run.needs_attention[0]["detail"])
+        self.assertIn("MRS_T1_3D", run.needs_attention[1]["detail"])
+        self.assertEqual(run.roots_listed, 1)
+        with self.assertRaises(ValueError) as ctx:
+            atlascatalog.list_root(ssh, inside)
+        self.assertIn("frames", str(ctx.exception))
+        self.assertEqual(seen, [ROOT_2024], "list_root refused before any find")
+
+    def test_a_file_named_frames_is_a_bad_name_not_a_folder(self):
+        run = self._catalog({ROOT_2024: _names("frames 10\nprocessing 10\nMRS_T1_3D 10")})
+        self.assertEqual(run.processing_files, 0)
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.BAD_NAME_REASON] * 3)
+
+    def test_hostile_folder_names_around_a_processing_folder(self):
+        run = self._catalog({ROOT_2024: _names("""
+            odd/frames/TCRMP20240412_3D_MRS_T1.MP4
+            a//frames//TCRMP20240412_3D_MRS_T2.MP4
+            ./frames/TCRMP20240412_3D_MRS_T3.MP4
+            frames.old/TCRMP20240412_3D_MRS_T4.MP4
+            processing/TCRMP20240412_3D_MRS_T5.MP4
+        """)})
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T4_2024_pbl"])
+        self.assertEqual(run.processing_files, 4)
+        self.assertEqual(run.needs_attention, [])
+
+    def test_the_count_of_files_inside_processing_folders_is_printed(self):
+        cfg = self._write_config(self.ARCHIVE9)
+        output = self._main(["--nas-config", cfg, "--dry-run"], {self.ARCHIVE9: _names(self.ARCHIVE9_SPEC)})
+        self.assertIn(f"inside processing folders, dropped after listing: {self.ARCHIVE9_FILES} files", output)
+        self.assertIn("never read inside: processing folders", output)
+        self.assertIn("No timepoints found.", output)
+        self.assertIn(f"listed {self.ARCHIVE9_FILES} files across 1 roots", output)
+
+    def test_a_processing_folder_under_the_shelf_counts_as_excluded_not_processing(self):
+        shelf = f"{self.ARCHIVE9}/driver_deposits"
+        run = self._catalog({self.ARCHIVE9: _names("driver_deposits/x/MRS_T1_3D/frames/y/TCRMP20240412_3D_MRS_T1.MP4")},
+                            excluded=[shelf])
+        self.assertEqual(run.rows, [])
+        self.assertEqual(run.excluded_files, 1)
+        self.assertEqual(run.processing_files, 0)
+
+
+# The 26 rulings Lauren made on 2026-09-14 16:26 AST, as catalog_rulings.csv
+# holds them: (volume, path under it, ruling, label, transect, date, part).
+RULED_2026_09_14 = [
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2023Annual/TCRMP20231112_demo_SPH_T1_again?.MP4", "catalog_as", "SPHSORT", "T1", "20231112", ""),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2023Annual/TCRMP20231115_demo_KGC_T3_WRONG.MP4", "catalog_as", "KGCSORT", "T3", "20231115", ""),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2023Annual/TCRMP20231205_demo_GKT_T2_WRONG.MP4", "catalog_as", "GKTSORT", "T2", "20231205", ""),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2023Annual/TCRMP20231207_demo_MRS_T3_part2?.MP4", "leave_out", "", "", "", ""),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240311_demo_CST_T1_OR_T2?.MP4", "catalog_as", "CSTSORT", "T1", "20240311", ""),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240311_demo_CST_T5_1.MP4", "catalog_as", "CSTSORT", "T5", "20240311", "1"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240311_demo_CST_T5_2.MP4", "catalog_as", "CSTSORT", "T5", "20240311", "2"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240311_demo_CST_T5_3.MP4", "catalog_as", "CSTSORT", "T5", "20240311", "3"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240311_demo_CST_T5_4.MP4", "catalog_as", "CSTSORT", "T5", "20240311", "4"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240311_demo_CST_T5_6.MP4", "catalog_as", "CSTSORT", "T5", "20240311", "5"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240311_demo_CST_T5_7.MP4", "catalog_as", "CSTSORT", "T5", "20240311", "6"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240408_demo_GKT_EXTRA_T1_1.MP4", "catalog_as", "GKTEXTRA", "T1", "20240408", "1"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240408_demo_GKT_EXTRA_T1_2.MP4", "catalog_as", "GKTEXTRA", "T1", "20240408", "2"),
+    ("/volume2/Archive9_10TB", "encoded/TCRMP_2024_PBL/TCRMP20240408_demo_GKT_EXTRA_T1_3.MP4", "catalog_as", "GKTEXTRA", "T1", "20240408", "3"),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_02/TCRMP20241024_3D_CRB_T3lit_Proxy.MOV", "catalog_as", "CRBLIT", "T3", "20241024", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_02/TCRMP20241024_3D_CRB_T3unlit_Proxy.MOV", "catalog_as", "CRBUNLIT", "T3", "20241024", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_03/TCRMP20241112_3D_CST_T5OFAV_Proxy.MOV", "catalog_as", "CST", "T5", "20241112", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_04/TCRMP20241113_3D_JKB_T2_2_Proxy.MOV", "catalog_as", "JKB", "T2", "20241113", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_04/TCRMP20241113_3D_JKB_T2_Proxy.MOV", "leave_out", "", "", "", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/TCRMP20241029_3D_SSJ_lobster1_Proxy.MOV", "leave_out", "", "", "", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/TCRMP20241029_3D_SSJ_lobster2_Proxy.MOV", "leave_out", "", "", "", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/TCRMP20241111_3D_BIX_boat1_Proxy.MOV", "leave_out", "", "", "", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/TCRMP20241111_3D_BIX_boat2_Proxy.MOV", "leave_out", "", "", "", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/TCRMP20241111_3D_BIX_overhead_Proxy.MOV", "leave_out", "", "", "", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/X016C122_24111246_TCRMP_Proxy.MOV", "leave_out", "", "", "", ""),
+    ("/volume4/Archive6_16TB", "TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/X016C127_2411126X_TCRMP_Proxy.MOV", "leave_out", "", "", "", ""),
+]
+RULED_LEAVE_OUT = 9
+RULED_CATALOG_AS = 17
+RULED_ROWS = ["CRBLIT_T3_2024ann", "CRBUNLIT_T3_2024ann", "CSTSORT_T1_2024_pbl", "CSTSORT_T5_2024_pbl",
+              "CST_T5_2024ann", "GKTEXTRA_T1_2024_pbl", "GKTSORT_T2_2023ann", "JKB_T2_2024ann",
+              "KGCSORT_T3_2023ann", "SPHSORT_T1_2023ann"]
+LIVE_RULINGS_CSV = "/mnt/rip/vicarius_drive/vicarius/_METADATA/3d/catalog_rulings.csv"
+
+
+class RulingTests(_CatalogCase):
+    """catalog_rulings.csv: Lauren's rulings on the files the catalog cannot
+    place, applied on every run.
+
+    A leave_out file is dropped before parsing and counted, never a
+    needs-attention line. A catalog_as file is parsed as if it were named
+    TCRMP{date}_3D_{label}_{T#}[_{part}] and then grouped, resolved and
+    recorded exactly like a well-named file: its real name and path on the
+    sidecar line and in original_videos, its part from the ruling, and the
+    ruling sentence first in its edit_note. A site label such as CSTSORT or
+    CRBLIT names a separate project, as the LBHLBPFIX labels did. The 26
+    rulings of 2026-09-14 (RULED_2026_09_14) are the shape.
+    """
+
+    VOL2 = "/volume2/Archive9_10TB"
+    VOL4 = "/volume4/Archive6_16TB"
+    ANN_2023 = f"{VOL2}/encoded/TCRMP_2023Annual"
+    PBL_2024 = f"{VOL2}/encoded/TCRMP_2024_PBL"
+    ANN_2024_03 = f"{VOL4}/TCRMP_2024Annual/encoded/TCRMP_2024Annual_03"
+    ANN_2024_04 = f"{VOL4}/TCRMP_2024Annual/encoded/TCRMP_2024Annual_04"
+    RULED_AT = "2026-09-14T16:26:00-04:00"
+    STAMP = "2026-09-14 16:26 AST"
+    OFAV = "TCRMP20241112_3D_CST_T5OFAV_Proxy.MOV"
+    OFAV_NOTE = "OFAV colony clip, the only 2024 annual file for Castle T5"
+    HEADER = ",".join(registry.RULING_COLUMNS) + "\n"
+
+    def _ruling(self, abs_path, ruling, label="", transect="", date="", part="", note="", who="LO", when=None):
+        """One ruling line as registry.rulings() returns it."""
+        return {"nas_path": f"{HOST}:{abs_path}", "file_name": posixpath.basename(abs_path), "ruling": ruling,
+                "site_label": label, "transect": transect, "date": date, "part": part, "note": note,
+                "ruled_by": who, "ruled_at": self.RULED_AT if when is None else when}
+
+    def _ofav_ruling(self, **cells):
+        """The CST T5 OFAV ruling, with any cell replaced by name (site_label="CST/T5" for a hostile one)."""
+        line = self._ruling(f"{self.ANN_2024_03}/{self.OFAV}", "catalog_as", "CST", "T5", "20241112", note=self.OFAV_NOTE)
+        line.update(cells)
+        return line
+
+    def _ruled_lines(self):
+        """The 26 rulings of 2026-09-14 as lines."""
+        return [self._ruling(f"{volume}/{relpath}", ruling, label, transect, date, part, note="to sort")
+                for volume, relpath, ruling, label, transect, date, part in RULED_2026_09_14]
+
+    def _ruled_listings(self):
+        """The 26 ruled files on their two volumes, each one GB."""
+        listings = {self.VOL2: [], self.VOL4: []}
+        for volume, relpath, *_ in RULED_2026_09_14:
+            listings[volume].append((relpath, GB))
+        return listings
+
+    def _rulings_file(self, text, name="rulings.csv"):
+        path = os.path.join(self.registry_root, name)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        return path
+
+    def _sentence(self, note, who="LO", stamp=None):
+        stamp = self.STAMP if stamp is None else stamp
+        return f"catalogued by ruling of {who} {stamp}: {note}"
+
+    # --- leave_out -----------------------------------------------------------
+
+    def test_a_leave_out_file_is_dropped_before_parsing_and_counted(self):
+        lobster = f"{self.VOL4}/TCRMP_2024Annual/encoded/TCRMP_2024Annual_EXTRA/TCRMP20241029_3D_SSJ_lobster1_Proxy.MOV"
+        run = self._catalog({self.VOL4: [(lobster[len(self.VOL4) + 1:], GB)]},
+                            rulings=[self._ruling(lobster, "leave_out", note="not a transect recording")])
+        self.assertEqual(run.rows, [])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.ruled_out, 1)
+        self.assertEqual(run.rulings_applied, 0)
+        self.assertEqual(self._sidecar(), [])
+
+    def test_the_jkb_pair_keeps_the_ruled_take_and_leaves_the_false_start_out(self):
+        false_start, take = "TCRMP20241113_3D_JKB_T2_Proxy.MOV", "TCRMP20241113_3D_JKB_T2_2_Proxy.MOV"
+        rulings = [self._ruling(f"{self.ANN_2024_04}/{false_start}", "leave_out", note="6.3 GB false start"),
+                   self._ruling(f"{self.ANN_2024_04}/{take}", "catalog_as", "JKB", "T2", "20241113",
+                                note="the 138 GB take is the recording")]
+        run = self._catalog({self.ANN_2024_04: _names(f"{false_start} 6300000000\n{take} 138000000000")}, rulings=rulings)
+        self.assertEqual([r["readable_id"] for r in run.rows], ["JKB_T2_2024ann"])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual((run.ruled_out, run.rulings_applied), (1, 1))
+        row = self.r.get("JKB_T2_2024ann")
+        self.assertEqual(row["original_videos"], take)
+        self.assertEqual(row["video_size_gb"], "138.0")
+        files = self._sidecar("JKB_T2_2024ann")
+        self.assertEqual([(f["file_name"], f["part"], f["in_row"]) for f in files], [(take, "", "true")])
+        self.assertEqual(files[0]["edit_note"],
+                         f"{self._sentence('the 138 GB take is the recording')}; {atlascatalog.NOTE_PROXY}")
+
+    # --- catalog_as ------------------------------------------------------------
+
+    def test_catalog_as_a_whole_file_makes_the_row_with_the_real_name_and_the_ruling_sentence(self):
+        run = self._catalog({self.ANN_2024_03: _names(f"{self.OFAV} 45000000000")}, rulings=[self._ofav_ruling()])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CST_T5_2024ann"])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.rulings_applied, 1)
+        row = self.r.get("CST_T5_2024ann")
+        self.assertEqual((row["site"], row["transect"], row["year"], row["season_token"]), ("CST", "T5", "2024", "ann"))
+        self.assertEqual(row["original_videos"], self.OFAV)
+        self.assertEqual(row["video_location"], f"{HOST}:{self.ANN_2024_03}")
+        self.assertEqual(row["video_size_gb"], "45.0")
+        files = self._sidecar("CST_T5_2024ann")
+        self.assertEqual(len(files), 1)
+        line = files[0]
+        self.assertEqual(line["file_name"], self.OFAV)
+        self.assertEqual(line["nas_path"], f"{HOST}:{self.ANN_2024_03}/{self.OFAV}")
+        self.assertEqual((line["part"], line["proxy"], line["in_row"], line["filmed_on"], line["container"]),
+                         ("", "true", "true", "2024-11-12", "mov"))
+        self.assertEqual(line["edit_note"], f"{self._sentence(self.OFAV_NOTE)}; {atlascatalog.NOTE_PROXY}")
+        self.assertEqual(line["edit_note"], "catalogued by ruling of LO 2026-09-14 16:26 AST: OFAV colony clip, "
+                                            "the only 2024 annual file for Castle T5; proxy suffix dropped at rename")
+
+    def test_catalog_as_a_labelled_whole_makes_the_labelled_row_beside_its_sibling(self):
+        folder = f"{self.VOL4}/TCRMP_2024Annual/encoded/TCRMP_2024Annual_02"
+        lit, unlit = "TCRMP20241024_3D_CRB_T3lit_Proxy.MOV", "TCRMP20241024_3D_CRB_T3unlit_Proxy.MOV"
+        rulings = [self._ruling(f"{folder}/{lit}", "catalog_as", "CRBLIT", "T3", "20241024", note="lighting take"),
+                   self._ruling(f"{folder}/{unlit}", "catalog_as", "CRBUNLIT", "T3", "20241024", note="lighting take")]
+        run = self._catalog({folder: _names(f"{lit}\n{unlit}")}, rulings=rulings)
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), ["CRBLIT_T3_2024ann", "CRBUNLIT_T3_2024ann"])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(self.r.get("CRBLIT_T3_2024ann")["site"], "CRBLIT")
+        self.assertEqual(self.r.get("CRBLIT_T3_2024ann")["original_videos"], lit)
+        self.assertEqual(self.r.get("CRBUNLIT_T3_2024ann")["original_videos"], unlit)
+
+    def test_a_ruled_part_set_makes_one_row_with_three_parts(self):
+        names = [f"TCRMP20240408_demo_GKT_EXTRA_T1_{n}.MP4" for n in (1, 2, 3)]
+        rulings = [self._ruling(f"{self.PBL_2024}/{name}", "catalog_as", "GKTEXTRA", "T1", "20240408", str(n),
+                                note="extra recording, joined") for n, name in enumerate(names, start=1)]
+        # Listed out of order: the row still reads in part order.
+        run = self._catalog({self.PBL_2024: _names("\n".join(reversed(names)))}, rulings=rulings)
+        self.assertEqual([r["readable_id"] for r in run.rows], ["GKTEXTRA_T1_2024_pbl"])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(run.rulings_applied, 3)
+        row = self.r.get("GKTEXTRA_T1_2024_pbl")
+        self.assertEqual(row["original_videos"], ";".join(names))
+        self.assertEqual(row["video_size_gb"], "3.0")
+        files = self._sidecar("GKTEXTRA_T1_2024_pbl")
+        self.assertEqual([(f["file_name"], f["part"], f["proxy"]) for f in files],
+                         [(name, str(n), "false") for n, name in enumerate(names, start=1)])
+        for line in files:
+            self.assertEqual(line["edit_note"], f"{self._sentence('extra recording, joined')}; {atlascatalog.NOTE_PARTS}")
+
+    def test_the_renumbered_castle_set_makes_six_parts_in_ruled_order(self):
+        archive_numbers = (1, 2, 3, 4, 6, 7)
+        names = [f"TCRMP20240311_demo_CST_T5_{n}.MP4" for n in archive_numbers]
+        note = "archive part 5 is missing; archive parts 6 and 7 become parts 5 and 6"
+        rulings = [self._ruling(f"{self.PBL_2024}/{name}", "catalog_as", "CSTSORT", "T5", "20240311", str(part), note=note)
+                   for part, name in enumerate(names, start=1)]
+        run = self._catalog({self.PBL_2024: _names("\n".join(names))}, rulings=rulings)
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CSTSORT_T5_2024_pbl"])
+        self.assertEqual(run.needs_attention, [])
+        row = self.r.get("CSTSORT_T5_2024_pbl")
+        self.assertEqual(row["original_videos"], ";".join(names))
+        files = self._sidecar("CSTSORT_T5_2024_pbl")
+        self.assertEqual([(f["file_name"], f["part"]) for f in files],
+                         [(name, str(part)) for part, name in enumerate(names, start=1)])
+        self.assertEqual(files[-1]["file_name"], "TCRMP20240311_demo_CST_T5_7.MP4")
+        self.assertEqual(files[-1]["part"], "6")
+        self.assertTrue(all(f["edit_note"] == f"{self._sentence(note)}; {atlascatalog.NOTE_PARTS}" for f in files))
+
+    def test_a_ruled_lone_part_is_the_row_with_the_lone_part_note(self):
+        name = "TCRMP20240311_demo_CST_T5_7.MP4"
+        run = self._catalog({self.PBL_2024: _names(name)},
+                            rulings=[self._ruling(f"{self.PBL_2024}/{name}", "catalog_as", "CSTSORT", "T5", "20240311", "2")])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CSTSORT_T5_2024_pbl"])
+        self.assertEqual(run.needs_attention, [])
+        files = self._sidecar("CSTSORT_T5_2024_pbl")
+        self.assertEqual([(f["file_name"], f["part"]) for f in files], [(name, "2")])
+        self.assertEqual(files[0]["edit_note"],
+                         f"catalogued by ruling of LO {self.STAMP}; {atlascatalog.NOTE_LONE_PART.format(part=2)}")
+
+    def test_the_sort_labels_make_their_own_rows_whatever_the_real_name_says(self):
+        cases = [(self.ANN_2023, "TCRMP20231112_demo_SPH_T1_again?.MP4", "SPHSORT", "T1", "20231112", "SPHSORT_T1_2023ann"),
+                 (self.ANN_2023, "TCRMP20231115_demo_KGC_T3_WRONG.MP4", "KGCSORT", "T3", "20231115", "KGCSORT_T3_2023ann"),
+                 (self.ANN_2023, "TCRMP20231205_demo_GKT_T2_WRONG.MP4", "GKTSORT", "T2", "20231205", "GKTSORT_T2_2023ann"),
+                 (self.PBL_2024, "TCRMP20240311_demo_CST_T1_OR_T2?.MP4", "CSTSORT", "T1", "20240311", "CSTSORT_T1_2024_pbl")]
+        listings = {self.ANN_2023: [], self.PBL_2024: []}
+        rulings = []
+        for folder, name, label, transect, date, _rid in cases:
+            listings[folder].append((name, GB))
+            rulings.append(self._ruling(f"{folder}/{name}", "catalog_as", label, transect, date))
+        # No name variant: the demo token in the real names never matters to a ruled file.
+        run = self._catalog(listings, rulings=rulings)
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), sorted(c[-1] for c in cases))
+        self.assertEqual(run.needs_attention, [])
+        for folder, name, label, _transect, _date, rid in cases:
+            self.assertEqual(self.r.get(rid)["original_videos"], name)
+            self.assertEqual(self.r.get(rid)["site"], label)
+            note = self._sidecar(rid)[0]["edit_note"]
+            self.assertNotIn(atlascatalog.NOTE_DEMO, note)
+            self.assertTrue(note.startswith("catalogued by ruling of LO"), note)
+
+    def test_a_ruled_file_groups_with_a_well_named_file_of_the_same_identity(self):
+        # Two whole proxies for CST T5 2024-11-12, neither canonical: "more than one whole file", as for any pair.
+        plain = "TCRMP20241112_3D_CST_T5_Proxy.MOV"
+        run = self._catalog({self.ANN_2024_03: _names(f"{self.OFAV}\n{plain}")}, rulings=[self._ofav_ruling()])
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.MULTI_WHOLE_REASON])
+        self.assertIn(self.OFAV, run.needs_attention[0]["detail"])
+        self.assertIn(plain, run.needs_attention[0]["detail"])
+        # Ruled as part 2 beside a well-named part 1: one complete set.
+        part1 = "TCRMP20241112_3D_CST_T5_1.MOV"
+        ruling = self._ruling(f"{self.ANN_2024_03}/{self.OFAV}", "catalog_as", "CST", "T5", "20241112", "2")
+        run = self._catalog({self.ANN_2024_03: _names(f"{self.OFAV}\n{part1}")}, rulings=[ruling])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CST_T5_2024ann"])
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(self.r.get("CST_T5_2024ann")["original_videos"], f"{part1};{self.OFAV}")
+        self.assertEqual([(f["file_name"], f["part"]) for f in self._sidecar("CST_T5_2024ann")],
+                         [(part1, "1"), (self.OFAV, "2")])
+
+    def test_an_override_on_a_ruled_file_is_reported_and_the_ruling_wins(self):
+        overrides = {self.OFAV: {"site": "CSTX", "note": "old override"}}
+        run = self._catalog({self.ANN_2024_03: _names(self.OFAV)}, rulings=[self._ofav_ruling()], overrides=overrides)
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CST_T5_2024ann"])
+        self.assertEqual([(i["reason"], i["path"]) for i in run.needs_attention],
+                         [(atlascatalog.OVERRIDE_ON_RULED_REASON, f"{self.ANN_2024_03}/{self.OFAV}")])
+        self.assertEqual(run.overrides_applied, 0)
+        self.assertNotIn("catalog_overrides.csv", self._sidecar("CST_T5_2024ann")[0]["edit_note"])
+
+    def test_a_ruled_file_is_matched_by_path_not_by_name(self):
+        # The same name in another folder is not the ruled file: it stays a bad name.
+        other = f"{self.VOL4}/elsewhere"
+        run = self._catalog({self.ANN_2024_03: _names(self.OFAV), other: _names(self.OFAV)}, rulings=[self._ofav_ruling()])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CST_T5_2024ann"])
+        self.assertEqual([(i["reason"], i["path"]) for i in run.needs_attention],
+                         [(atlascatalog.BAD_NAME_REASON, f"{other}/{self.OFAV}")])
+
+    def test_a_root_spelled_with_a_trailing_slash_still_matches_the_ruling(self):
+        run = self._catalog({self.ANN_2024_03 + "/": _names(self.OFAV)}, rulings=[self._ofav_ruling()])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CST_T5_2024ann"])
+        self.assertEqual(run.needs_attention, [])
+
+    def test_a_ruling_for_another_host_never_matches(self):
+        ruling = self._ofav_ruling()
+        ruling["nas_path"] = "other.nas:" + f"{self.ANN_2024_03}/{self.OFAV}"
+        run = self._catalog({self.ANN_2024_03: _names(self.OFAV)}, rulings=[ruling])
+        self.assertEqual(run.rows, [])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.BAD_NAME_REASON])
+
+    # --- a ruling whose file the listing does not contain ---------------------
+
+    def test_a_ruling_whose_file_is_not_listed_is_reported_once_across_overlapping_roots(self):
+        missing = f"{self.ANN_2024_03}/TCRMP20241112_3D_CST_T5GONE_Proxy.MOV"
+        ruling = self._ruling(missing, "catalog_as", "CST", "T5", "20241112", note="gone")
+        listings = {self.VOL4: [(f"TCRMP_2024Annual/encoded/TCRMP_2024Annual_03/{self.OFAV}", GB)],
+                    self.ANN_2024_03: _names(self.OFAV)}
+        run = self._catalog(listings, roots=[self.VOL4, self.ANN_2024_03], rulings=[ruling, self._ofav_ruling()])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["CST_T5_2024ann"])
+        self.assertEqual([(i["root"], i["path"], i["reason"]) for i in run.needs_attention],
+                         [(self.VOL4, missing, atlascatalog.RULED_FILE_NOT_FOUND_REASON)])
+        detail = run.needs_attention[0]["detail"]
+        self.assertIn("catalog_as", detail)
+        self.assertIn("CST T5 20241112", detail)
+        self.assertEqual(run.rulings_applied, 1)
+
+    def test_a_ruling_under_no_walked_root_is_not_reported(self):
+        run = self._catalog({self.ANN_2023: _names("TCRMP20231207_3D_MRS_T1.MP4")}, rulings=[self._ofav_ruling()])
+        self.assertEqual([r["readable_id"] for r in run.rows], ["MRS_T1_2023ann"])
+        self.assertEqual(run.needs_attention, [])
+
+    def test_a_ruling_under_an_unmounted_root_is_not_reported(self):
+        run = self._catalog({self.VOL4: None}, rulings=[self._ofav_ruling()])
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.UNMOUNTED_REASON])
+
+    def test_a_ruled_file_inside_a_processing_folder_is_dropped_and_reported_not_found(self):
+        inside = f"{self.VOL4}/x/frames/{self.OFAV}"
+        run = self._catalog({self.VOL4: _names(f"x/frames/{self.OFAV}")},
+                            rulings=[self._ruling(inside, "catalog_as", "CST", "T5", "20241112")])
+        self.assertEqual(run.rows, [])
+        self.assertEqual(run.processing_files, 1)
+        self.assertEqual([(i["path"], i["reason"]) for i in run.needs_attention],
+                         [(inside, atlascatalog.RULED_FILE_NOT_FOUND_REASON)])
+
+    def test_a_leave_out_whose_file_is_not_listed_is_reported_too(self):
+        gone = f"{self.ANN_2024_04}/gone.MOV"
+        run = self._catalog({self.ANN_2024_04: _names("TCRMP20241113_3D_JKB_T1_Proxy.MOV")},
+                            rulings=[self._ruling(gone, "leave_out", note="x")])
+        self.assertEqual([(i["path"], i["reason"]) for i in run.needs_attention],
+                         [(gone, atlascatalog.RULED_FILE_NOT_FOUND_REASON)])
+        self.assertIn("leave_out", run.needs_attention[0]["detail"])
+
+    # --- the sentence and the stamp -------------------------------------------
+
+    def test_the_ruling_sentence_forms(self):
+        line = {"ruled_by": "LO", "ruled_at": self.RULED_AT, "note": "why"}
+        self.assertEqual(atlascatalog._ruling_note(line), "catalogued by ruling of LO 2026-09-14 16:26 AST: why")
+        self.assertEqual(atlascatalog._ruling_note({**line, "note": ""}), "catalogued by ruling of LO 2026-09-14 16:26 AST")
+        self.assertEqual(atlascatalog._ruling_note({**line, "ruled_at": ""}), "catalogued by ruling of LO: why")
+        self.assertEqual(atlascatalog._ruling_note({**line, "ruled_at": "", "note": ""}), "catalogued by ruling of LO")
+
+    def test_the_stamp_reads_in_ast(self):
+        self.assertEqual(atlascatalog._ruling_stamp("2026-09-14T16:26:00-04:00"), "2026-09-14 16:26 AST")
+        self.assertEqual(atlascatalog._ruling_stamp("2026-09-14T20:26:00+00:00"), "2026-09-14 16:26 AST")
+        self.assertEqual(atlascatalog._ruling_stamp("2026-09-14T16:26:00"), "2026-09-14 16:26 AST")
+        self.assertEqual(atlascatalog._ruling_stamp("2026-09-14 16:26 AST"), "2026-09-14 16:26 AST")
+        self.assertEqual(atlascatalog._ruling_stamp("whenever"), "whenever")
+        self.assertEqual(atlascatalog._ruling_stamp(""), "")
+
+    def test_edit_note_puts_the_ruling_sentence_first(self):
+        sentence = "catalogued by ruling of LO 2026-09-14 16:26 AST: x"
+        note = atlascatalog._edit_note("", "2025-04-15", 2, True, kind=atlascatalog.KIND_RULED, ruling_note=sentence)
+        self.assertEqual(note, f"{sentence}; second recording on 2025-04-15, not counted in the row; see needs-attention; "
+                               f"{atlascatalog.NOTE_PARTS}; {atlascatalog.NOTE_PROXY}")
+        self.assertEqual(atlascatalog._edit_note("", None, 0, False, kind=atlascatalog.KIND_RULED, ruling_note=sentence), sentence)
+        with self.assertRaises(TypeError):
+            atlascatalog._edit_note("", None, 0, False, ruling_note=3)
+
+    # --- reading the file -------------------------------------------------------
+
+    def test_load_rulings_missing_or_empty_file_means_none(self):
+        self.assertEqual(atlascatalog.load_rulings(os.path.join(self.registry_root, "absent.csv")), ([], []))
+        self.assertEqual(atlascatalog.load_rulings(self._rulings_file("")), ([], []))
+        self.assertEqual(atlascatalog.load_rulings(self._rulings_file(self.HEADER)), ([], []))
+
+    def test_load_rulings_reads_the_registry_s_own_file(self):
+        self.r.set_ruling(f"{HOST}:{self.ANN_2024_03}/{self.OFAV}", self.OFAV, "catalog_as", "atlas:LO",
+                          site_label="CST", transect="T5", date="20241112", note=self.OFAV_NOTE)
+        lines, problems = atlascatalog.load_rulings(self.r.RULINGS_CSV)
+        self.assertEqual(problems, [])
+        self.assertEqual([(l["file_name"], l["ruling"], l["site_label"], l["ruled_by"]) for l in lines],
+                         [(self.OFAV, "catalog_as", "CST", "LO")])
+        self.assertEqual(list(lines[0]), registry.RULING_COLUMNS)
+
+    def test_a_malformed_line_in_the_rulings_file_is_reported_not_fatal(self):
+        good = f"{HOST}:{self.ANN_2024_03}/{self.OFAV},{self.OFAV},catalog_as,CST,T5,20241112,,ok,LO,{self.RULED_AT}\n"
+        bad_label = f"{HOST}:{self.ANN_2024_03}/a.MOV,a.MOV,catalog_as,CST/T5,T5,20241112,,x,LO,{self.RULED_AT}\n"
+        bad_date = f"{HOST}:{self.ANN_2024_03}/b.MOV,b.MOV,catalog_as,CST,T5,20241399,,x,LO,{self.RULED_AT}\n"
+        path = self._rulings_file(self.HEADER + good + bad_label + bad_date)
+        lines, problems = atlascatalog.load_rulings(path)
+        self.assertEqual([l["file_name"] for l in lines], [self.OFAV])
+        self.assertEqual([(p["root"], p["path"], p["reason"]) for p in problems],
+                         [(atlascatalog.RULINGS_FILENAME, "line 3", atlascatalog.RULING_MALFORMED_REASON),
+                          (atlascatalog.RULINGS_FILENAME, "line 4", atlascatalog.RULING_MALFORMED_REASON)])
+        self.assertIn("site_label", problems[0]["detail"])
+        self.assertIn("CST/T5", problems[0]["detail"])
+        self.assertIn("date", problems[1]["detail"])
+        self.assertIn("20241399", problems[1]["detail"])
+
+    def test_every_malformed_shape_is_a_problem_line_naming_its_field(self):
+        base = f"{HOST}:{self.ANN_2024_03}/{self.OFAV},{self.OFAV}"
+        shapes = [
+            (f"{base},keep,,,,,x,LO,{self.RULED_AT}\n", "ruling"),
+            (f"{base},catalog_as,CST,5,20241112,,x,LO,{self.RULED_AT}\n", "transect"),
+            (f"{base},catalog_as,CST,T5,2024-11-12,,x,LO,{self.RULED_AT}\n", "date"),
+            (f"{base},catalog_as,CST,T5,20241112,0,x,LO,{self.RULED_AT}\n", "part"),
+            (f"{base},catalog_as,CST,T5,20241112,two,x,LO,{self.RULED_AT}\n", "part"),
+            (f"{base},catalog_as,,T5,20241112,,x,LO,{self.RULED_AT}\n", "site_label"),
+            (f"{base},catalog_as,CST,T5,20241112,,x,,{self.RULED_AT}\n", "ruled_by"),
+            (f"{base},leave_out,CST,,,,x,LO,{self.RULED_AT}\n", "no placement"),
+            (f"{HOST}:{self.ANN_2024_03}/{self.OFAV},other.MOV,leave_out,,,,,x,LO,{self.RULED_AT}\n", "file_name"),
+            (f"/no/host/{self.OFAV},{self.OFAV},leave_out,,,,,x,LO,{self.RULED_AT}\n", "nas_path"),
+            (f"{base},leave_out,,,,,x,LO,{self.RULED_AT}\n{base},leave_out,,,,,y,LO,{self.RULED_AT}\n", "line 2"),
+            (f"{base},catalog_as,CST,T5,20241112,,x,LO\n", "fields"),
+        ]
+        for text, field in shapes:
+            lines, problems = atlascatalog.load_rulings(self._rulings_file(self.HEADER + text))
+            self.assertEqual(len(problems), 1, (text, problems))
+            self.assertIn(field, problems[0]["detail"], text)
+            self.assertLessEqual(len(lines), 1, text)
+
+    def test_a_wrong_header_is_one_problem_and_no_ruling(self):
+        lines, problems = atlascatalog.load_rulings(self._rulings_file("path,name\nx,y\n"))
+        self.assertEqual(lines, [])
+        self.assertEqual([(p["path"], p["reason"]) for p in problems], [("line 1", atlascatalog.RULING_MALFORMED_REASON)])
+        self.assertIn(",".join(registry.RULING_COLUMNS), problems[0]["detail"])
+
+    def test_a_hostile_note_and_a_control_character_in_a_cell(self):
+        hostile = 'note with "quotes", commas; semicolons and <b>tags</b>'
+        line = self._ofav_ruling(note=hostile)
+        run = self._catalog({self.ANN_2024_03: _names(self.OFAV)}, rulings=[line])
+        self.assertEqual(self._sidecar("CST_T5_2024ann")[0]["edit_note"],
+                         f"{self._sentence(hostile)}; {atlascatalog.NOTE_PROXY}")
+        text = f'{HOST}:{self.ANN_2024_03}/{self.OFAV},{self.OFAV},catalog_as,CST,T5,20241112,,"a\nb",LO,{self.RULED_AT}\n'
+        lines, problems = atlascatalog.load_rulings(self._rulings_file(self.HEADER + text))
+        self.assertEqual(lines, [])
+        self.assertIn("control character", problems[0]["detail"])
+
+    def test_a_hostile_programmatic_ruling_is_refused_before_any_listing(self):
+        calls = []
+
+        def runner(argv, timeout=60):
+            calls.append(argv)
+            return (0, "", "")
+
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key", runner=runner)
+        for bad in ("x", [1], [{"nas_path": 3}], [self._ofav_ruling(site_label="CST/T5")],
+                    [self._ofav_ruling(date="20241399")], [self._ofav_ruling(part="0")],
+                    [self._ruling(f"{self.ANN_2024_03}/{self.OFAV}", "leave_out", label="CST")],
+                    [self._ofav_ruling(), self._ofav_ruling()], {"nas_path": "x"}):
+            with self.assertRaises((TypeError, ValueError), msg=repr(bad)) as ctx:
+                atlascatalog.catalog([self.ANN_2024_03], ssh, rulings=bad, dry_run=True)
+            self.assertNotIn("Traceback", str(ctx.exception))
+        self.assertEqual(calls, [], "nothing was listed")
+        with self.assertRaises(ValueError) as ctx:
+            atlascatalog.catalog([self.ANN_2024_03], ssh, rulings=[self._ofav_ruling(site_label="CST/T5")], dry_run=True)
+        self.assertIn("letters and digits", str(ctx.exception))
+        self.assertEqual(sorted(os.listdir(self.registry_root)), [])
+
+    # --- the run as a whole -----------------------------------------------------
+
+    def test_the_full_ruled_shape_of_2026_09_14(self):
+        listings = self._ruled_listings()
+        listings[self.VOL2].append(("encoded/TCRMP_2023Annual/TCRMP20231207_demo_MRS_T3_part1.MP4", GB))
+        listings[self.VOL4].append(("TCRMP_2024Annual/encoded/TCRMP_2024Annual_04/TCRMP20241113_3D_JKB_T1_Proxy.MOV", GB))
+        run = self._catalog(listings, rulings=self._ruled_lines(), variants=("demo",))
+        self.assertEqual(run.needs_attention, [])
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), sorted(RULED_ROWS + ["JKB_T1_2024ann", "MRS_T3_2023ann"]))
+        self.assertEqual((run.ruled_out, run.rulings_applied), (RULED_LEAVE_OUT, RULED_CATALOG_AS))
+        self.assertEqual(run.listed_files, len(RULED_2026_09_14) + 2)
+        self.assertEqual(len(self._sidecar("CSTSORT_T5_2024_pbl")), 6)
+        self.assertEqual(len(self._sidecar("GKTEXTRA_T1_2024_pbl")), 3)
+        self.assertEqual(len(self._sidecar()), RULED_CATALOG_AS + 2)
+        self.assertEqual(self.r.get("CSTSORT_T5_2024_pbl")["original_videos"],
+                         ";".join(f"TCRMP20240311_demo_CST_T5_{n}.MP4" for n in (1, 2, 3, 4, 6, 7)))
+        self.assertEqual(self.r.get("MRS_T3_2023ann")["original_videos"], "TCRMP20231207_demo_MRS_T3_part1.MP4")
+        for row in self.r.load():
+            self.assertEqual(row["video_location"].split(":", 1)[0], HOST)
+        # Without the demo variant the ruled rows stand unchanged; only the well-named demo file is a bad name.
+        run = self._catalog(self._ruled_listings(), rulings=self._ruled_lines())
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), RULED_ROWS)
+        self.assertEqual(run.needs_attention, [])
+
+    def test_a_rerun_with_rulings_is_byte_identical(self):
+        listings = self._ruled_listings()
+        self._catalog(listings, rulings=self._ruled_lines())
+        paths = (self.r.REGISTRY_CSV, self.r.SOURCE_FILES_CSV, self.r.EVENTS_CSV)
+
+        def read_all():
+            out = []
+            for path in paths:
+                with open(path, "rb") as fh:
+                    out.append(fh.read())
+            return out
+
+        first = read_all()
+        time.sleep(1.1)
+        self._catalog(listings, rulings=self._ruled_lines())
+        self.assertEqual(first, read_all())
+
+    def test_the_report_replaces_the_previous_override_and_ruling_lines_every_run(self):
+        previous = [{"root": atlascatalog.OVERRIDES_FILENAME, "path": "x", "reason": atlascatalog.OVERRIDE_UNLISTED_REASON, "detail": ""},
+                    {"root": atlascatalog.RULINGS_FILENAME, "path": "line 3", "reason": atlascatalog.RULING_MALFORMED_REASON, "detail": ""},
+                    {"root": ROOT_2025, "path": f"{ROOT_2025}/GOPR0001.MP4", "reason": atlascatalog.BAD_NAME_REASON, "detail": ""}]
+        atlascatalog.write_needs_attention_report(previous)
+        atlascatalog.write_needs_attention_report([], walked_roots=[ROOT_2024])
+        self.assertEqual([i["root"] for i in self.r.needs_attention()], [ROOT_2025])
+
+    @unittest.skipUnless(os.path.exists(LIVE_RULINGS_CSV), "the live rulings file is not on this machine")
+    def test_the_live_rulings_file_reads_with_no_problem(self):
+        lines, problems = atlascatalog.load_rulings(LIVE_RULINGS_CSV)
+        self.assertEqual(problems, [])
+        self.assertGreaterEqual(len(lines), 1)
+        self.assertTrue(all(l["ruling"] in registry.RULING_VALUES for l in lines))
+        self.assertTrue(all(l["nas_path"].startswith(HOST + ":/") for l in lines))
+
+    # --- the command line ---------------------------------------------------------
+
+    def test_cli_applies_the_registry_s_rulings_by_default(self):
+        self.r.set_ruling(f"{HOST}:{self.ANN_2024_03}/{self.OFAV}", self.OFAV, "catalog_as", "atlas:LO",
+                          site_label="CST", transect="T5", date="20241112", note=self.OFAV_NOTE)
+        cfg = self._write_config(self.ANN_2024_03)
+        output = self._main(["--nas-config", cfg, "--dry-run"], {self.ANN_2024_03: _names(self.OFAV)})
+        self.assertIn("CST_T5_2024ann", output)
+        self.assertIn(f"rulings: {self.r.RULINGS_CSV} (1 ruling)", output)
+        self.assertIn("rulings applied: 1", output)
+        self.assertIn("files ruled out: 0", output)
+        self.assertIn("needs attention: 0", output)
+
+    def test_cli_rulings_flag_points_elsewhere_and_no_rulings_ignores_the_file(self):
+        self.r.set_ruling(f"{HOST}:{self.ANN_2024_03}/{self.OFAV}", self.OFAV, "leave_out", "atlas:LO", note="x")
+        elsewhere = self._rulings_file(self.HEADER + f"{HOST}:{self.ANN_2024_03}/{self.OFAV},{self.OFAV},catalog_as,"
+                                       f"CST,T5,20241112,,\"{self.OFAV_NOTE}\",LO,{self.RULED_AT}\n", name="elsewhere.csv")
+        cfg = self._write_config(self.ANN_2024_03)
+        listings = {self.ANN_2024_03: _names(self.OFAV)}
+        output = self._main(["--nas-config", cfg, "--dry-run", "--rulings", elsewhere], listings)
+        self.assertIn("CST_T5_2024ann", output)
+        self.assertIn(f"rulings: {elsewhere} (1 ruling)", output)
+        output = self._main(["--nas-config", cfg, "--dry-run", "--no-rulings"], listings)
+        self.assertNotIn("CST_T5_2024ann", output)
+        self.assertIn("rulings: ignored (--no-rulings)", output)
+        self.assertIn(atlascatalog.BAD_NAME_REASON, output)
+        self.assertIn("needs attention: 1", output)
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                atlascatalog._parser().parse_args(["--rulings", elsewhere, "--no-rulings"])
+
+    def test_cli_says_when_the_rulings_file_is_missing(self):
+        cfg = self._write_config(self.ANN_2024_03)
+        missing = os.path.join(self.registry_root, "absent.csv")
+        output = self._main(["--nas-config", cfg, "--dry-run", "--rulings", missing], {self.ANN_2024_03: _names(self.OFAV)})
+        self.assertIn(f"rulings: {missing} (no file; none apply)", output)
+
+    def test_cli_prints_a_malformed_ruling_line_before_listing_and_reports_it(self):
+        good = f"{HOST}:{self.ANN_2024_03}/{self.OFAV},{self.OFAV},catalog_as,CST,T5,20241112,,ok,LO,{self.RULED_AT}\n"
+        bad = f"{HOST}:{self.ANN_2024_03}/a.MOV,a.MOV,catalog_as,CST/T5,T5,20241112,,x,LO,{self.RULED_AT}\n"
+        path = self._rulings_file(self.HEADER + good + bad)
+        cfg = self._write_config(self.ANN_2024_03)
+        output = self._main(["--nas-config", cfg, "--rulings", path], {self.ANN_2024_03: _names(self.OFAV)})
+        warning = f"skipped ruling line 3 of {path}: "
+        self.assertIn(warning, output)
+        self.assertLess(output.index(warning), output.index("readable_id"), "the warning comes before the listing")
+        self.assertIn("CST_T5_2024ann", output)
+        self.assertIn("Step 2 complete", output)
+        report = self.r.needs_attention()
+        self.assertEqual([(i["root"], i["path"], i["reason"]) for i in report],
+                         [(atlascatalog.RULINGS_FILENAME, "line 3", atlascatalog.RULING_MALFORMED_REASON)])
+        self.assertIn("site_label", report[0]["detail"])
+
+
+class ProcessingFolderRealFindTests(_CatalogCase):
+    """The prune expression, proven against a real GNU find on a local temp
+    tree (the NAS is never touched: this is /usr/bin/find over a folder
+    under the test's own temp root, no ssh)."""
+
+    def _local_find_runner(self, argv, timeout=60):
+        """Run the composed find locally, as the NAS would run it over ssh."""
+        done = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout)
+        return (done.returncode, done.stdout, done.stderr)
+
+    def test_the_prune_expression_works_in_a_real_find(self):
+        tree = tempfile.mkdtemp(dir=self.registry_root)
+        kept = ["TCRMP_2024_PBL/TCRMP20240412_3D_MRS_T1.MP4",
+                "TCRMP_2024_PBL/TCRMP2024_postbl_3D_DemoVideos/TCRMP20240412_3D_MRS_T2.MP4",
+                "TCRMP_2024_PBL/frames.old/TCRMP20240412_3D_MRS_T4.MP4",
+                "TCRMP_2024_PBL/frames"]
+        pruned = ["TCRMP_2025_PBL/TCRMP_2025_PBL_01/processing/frames/x/TCRMP20250321_3D_MRS_T1_Proxy.MOV",
+                  "TCRMP_2025_PBL/Frames/TCRMP20250321_3D_MRS_T2_Proxy.MOV",
+                  "TCRMP_2024_PBL/MRS_T3_3D/frames/y/TCRMP20240412_3D_MRS_T3.MP4",
+                  "TCRMP_2024_PBL/MRS_T3_2023ann_3dprocessing/report.pdf",
+                  "TCRMP_2024_PBL/@eaDir/thumb.jpg"]
+        for relpath in kept + pruned:
+            os.makedirs(os.path.join(tree, os.path.dirname(relpath)), exist_ok=True)
+            with open(os.path.join(tree, relpath), "w") as fh:
+                fh.write("x")
+        ssh = atlascatalog.SSH(HOST, "driver_svc", "/fake/key", runner=self._local_find_runner)
+        entries = atlascatalog.list_root(ssh, tree)
+        self.assertEqual(sorted(rel for rel, _size in entries), sorted(kept))
+        self.assertEqual({size for _rel, size in entries}, {1})
+        run = atlascatalog.catalog([tree], ssh, dry_run=True)
+        self.assertEqual(sorted(r["readable_id"] for r in run.rows), ["MRS_T1_2024_pbl", "MRS_T2_2024_pbl", "MRS_T4_2024_pbl"])
+        self.assertEqual(run.processing_files, 0, "the NAS-side prune left nothing for layer two")
+        # The regular file named frames is a bad name, as it is a file and not a folder.
+        self.assertEqual([i["reason"] for i in run.needs_attention], [atlascatalog.BAD_NAME_REASON])
+        self.assertTrue(run.needs_attention[0]["path"].endswith("/frames"))
+
+
+class RulingFileToleranceTests(_CatalogCase):
+    """What a rulings file can be and still never stop a run."""
+
+    def test_a_rulings_path_that_is_a_directory_is_a_plain_error(self):
+        with self.assertRaises(OSError) as ctx:
+            atlascatalog.load_rulings(self.registry_root)
+        self.assertIn(self.registry_root, str(ctx.exception))
+
+    def test_a_rulings_file_in_another_encoding_still_reads(self):
+        path = os.path.join(self.registry_root, "latin.csv")
+        text = (",".join(registry.RULING_COLUMNS) + "\n"
+                f"{HOST}:/volume4/x/a.MOV,a.MOV,leave_out,,,,,café note,LO,2026-09-14T16:26:00-04:00\n")
+        with open(path, "wb") as fh:
+            fh.write(text.encode("latin-1"))
+        lines, problems = atlascatalog.load_rulings(path)
+        self.assertEqual(problems, [])
+        self.assertEqual([l["file_name"] for l in lines], ["a.MOV"])
+        self.assertTrue(lines[0]["note"].startswith("caf"))
+
+    def test_a_huge_rulings_file_and_listing_in_bounded_time(self):
+        root = "/volume4/Archive6_16TB/TCRMP_2024Annual/encoded"
+        count = 5000
+        rulings = [{"nas_path": f"{HOST}:{root}/odd_{n}.MOV", "file_name": f"odd_{n}.MOV", "ruling": "catalog_as",
+                    "site_label": "CST", "transect": f"T{n}", "date": "20241112", "part": "", "note": "n",
+                    "ruled_by": "LO", "ruled_at": "2026-09-14T16:26:00-04:00"} for n in range(1, count + 1)]
+        listing = [(f"odd_{n}.MOV", GB) for n in range(1, count + 1)]
+        listing += [(f"MRS_T1_3D/frames/x/frame_{n}.jpg", 100) for n in range(count)]
+        started = time.monotonic()
+        run = self._catalog({root: listing}, rulings=rulings, dry_run=True)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(len(run.rows), count)
+        self.assertEqual(run.rulings_applied, count)
+        self.assertEqual(run.processing_files, count)
+        self.assertEqual(run.needs_attention, [])
+
+    @unittest.skipUnless(os.path.exists(LIVE_RULINGS_CSV), "the live rulings file is not on this machine")
+    def test_main_with_the_live_rulings_file_over_the_ruled_shape(self):
+        """End to end through the command line with the real rulings file
+        (read only) over a fake listing of exactly the files it rules on."""
+        lines, _problems = atlascatalog.load_rulings(LIVE_RULINGS_CSV)
+        listings = {}
+        for line in lines:
+            path = line["nas_path"].split(":", 1)[1]
+            volume = "/" + path.split("/")[1]
+            listings.setdefault(volume, []).append((path[len(volume) + 1:], GB))
+        fd, cfg = tempfile.mkstemp(suffix=".yaml")
+        os.close(fd)
+        self.addCleanup(os.remove, cfg)
+        with open(cfg, "w") as fh:
+            fh.write(f"host: {HOST}\nuser: driver_svc\nkey: /fake/key\nsource_roots:\n")
+            fh.writelines(f"  - {volume}\n" for volume in sorted(listings))
+        output = self._main(["--nas-config", cfg, "--dry-run", "--rulings", LIVE_RULINGS_CSV], listings)
+        self.assertIn(f"rulings: {LIVE_RULINGS_CSV} ({len(lines)} rulings)", output)
+        leave_out = sum(1 for l in lines if l["ruling"] == registry.RULING_LEAVE_OUT)
+        self.assertIn(f"rulings applied: {len(lines) - leave_out}; files ruled out: {leave_out}", output)
+        self.assertIn("needs attention: 0", output)
+        self.assertNotIn("skipped ruling", output)
+
+
+class ProjectRootAndLiveRowTests(_CatalogCase):
+    """Two guards of 2026-09-14: a Voyager 1 project root is never read, and a live row is never rewritten."""
+
+    def test_a_folder_holding_analysis_params_is_dropped_whole(self):
+        entries = [("TCRMP_2025_PBL_01/analysis_params.yaml", 9697),
+                   ("TCRMP_2025_PBL_01/video_source", 1584),
+                   ("TCRMP_2025_PBL_01/notes/TCRMP20250320_3D_SHR_T5_Proxy.MOV", 100),
+                   ("TCRMP_2025_PBL_RAW_01/TCRMP20250321_3D_MRS_T1_Proxy.MOV", 100)]
+        kept, dropped = atlascatalog._drop_processing(entries)
+        self.assertEqual([e[0] for e in kept], ["TCRMP_2025_PBL_RAW_01/TCRMP20250321_3D_MRS_T1_Proxy.MOV"])
+        self.assertEqual(dropped, 3)
+
+    def test_a_row_whose_run_is_live_is_left_alone(self):
+        import fcntl
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        self.r.upsert("MRS_T9_2024ann", {"site": "MRS", "transect": "T9", "year": "2024", "season_token": "ann",
+                                         "video_location": "h:/archive/old", "processing_location": folder}, actor="seed")
+        self.r.upsert("MRS_T8_2024ann", {"site": "MRS", "transect": "T8", "year": "2024", "season_token": "ann",
+                                         "video_location": "h:/archive/old"}, actor="seed")
+        lock = open(os.path.join(folder, ".processing.lock"), "w")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # video_size_gb is a catalog-owned cell (video_location is operator-protected on a rerun)
+        rows = [{"readable_id": rid, "fields": {"video_size_gb": "9.99"}, "files": []} for rid in ("MRS_T9_2024ann", "MRS_T8_2024ann")]
+        written, files, left = atlascatalog.write_rows(rows, "catalog")
+        self.assertEqual((written, files, left), (1, 0, ["MRS_T9_2024ann"]))
+        rows_now = {r["readable_id"]: r for r in self.r.load()}
+        self.assertEqual(rows_now["MRS_T9_2024ann"]["video_size_gb"], "")
+        self.assertEqual(rows_now["MRS_T8_2024ann"]["video_size_gb"], "9.99")
+
+
+    def test_a_row_whose_video_sits_on_the_workbench_is_left_alone(self):
+        # The pull flips video_location to a local folder; the three sibling
+        # timepoints of a running turn hold no lock yet (2026-09-14 19:02 AST).
+        self.r.upsert("MRS_T7_2024ann", {"site": "MRS", "transect": "T7", "year": "2024", "season_token": "ann",
+                                         "video_location": "/mnt/rip/driver_staging/batch_x/turn001/TCRMP_2024Annual_05",
+                                         "original_videos": "TCRMP20241122_3D_MRS_T7.MOV"}, actor="seed")
+        rows = [{"readable_id": "MRS_T7_2024ann", "fields": {"original_videos": "TCRMP20241122_3D_MRS_T7_Proxy.MOV", "video_size_gb": "1.0"}, "files": []}]
+        self.assertEqual(atlascatalog.write_rows(rows, "catalog"), (0, 0, ["MRS_T7_2024ann"]))
+        row = {r["readable_id"]: r for r in self.r.load()}["MRS_T7_2024ann"]
+        self.assertEqual(row["original_videos"], "TCRMP20241122_3D_MRS_T7.MOV")
+
+
+class PreviousReportCoverageTests(_CatalogCase):
+    def test_a_previous_line_under_a_walked_root_is_replaced(self):
+        # The 2026-09-04 report was written per season folder; a walk of the
+        # whole volume on 2026-09-14 covers those folders and replaces them.
+        path = self.r.NEEDS_ATTENTION_CSV
+        with open(path, "w", newline="") as fh:
+            fh.write("root,path,reason,detail\n")
+            fh.write("/vol/enc/TCRMP_2024_PBL,/vol/enc/TCRMP_2024_PBL/x.MP4,name does not match,\n")
+            fh.write("/other/enc/TCRMP_2024_PBL,/other/enc/TCRMP_2024_PBL/y.MP4,name does not match,\n")
+            fh.write("/volx/enc,/volx/enc/z.MP4,name does not match,\n")
+        kept = atlascatalog._kept_from_previous_report(path, ["/vol"])
+        self.assertEqual([k["path"] for k in kept], ["/other/enc/TCRMP_2024_PBL/y.MP4", "/volx/enc/z.MP4"])

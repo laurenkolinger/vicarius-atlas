@@ -92,19 +92,58 @@ user, key, `source_roots`) and talks to the NAS only through plain ssh
 LISTING commands (a recursive `find`) -- no file is ever pulled down, and
 nothing on the NAS is ever renamed. The Archive stays read-only end to end.
 
-For each season root it walks recursively (nested folders are expected
+Two configured paths are never walked or catalogued, whatever source root
+holds them: the Shelf (`defaults.shelf_root` in `nas.yaml`, where the
+Carousel deposits processing folders) and the merged root (`merged_root`,
+where merged recordings are deposited). The Shelf sits inside the source
+root `/volume6/Archive8_12TB`, and on 2026-09-14 a dry run over
+`source_roots` reported 61,216 deposited frames, scripts and byte-code
+files as names that do not match, beside 46 other findings. Two layers keep
+them out: the `find` prunes them on the NAS (one `-path` term per excluded
+path under the root being listed, beside the Synology `@eaDir` and
+`#recycle` prune), and `catalog()` drops anything still listed under one of
+them (the run's counts report it as `excluded after listing`). A `--root`
+at or under one of them is never listed: it appears in the needs-attention
+review as `root is at or under the Shelf or the merged root, which the
+catalog never walks`, naming the covering path. Comparison is by whole path
+segment after a `146.226.147.140:` host prefix is stripped, so
+`/volume6/Archive8` never excludes `/volume6/Archive8_12TB/x`. A `nas.yaml`
+without those keys excludes nothing.
+
+A processing folder is never read inside, whatever root holds it: a
+directory named `processing` or `frames` (either case), one named
+`{SITE}_{T#}_3D` (the transect processing folder `naming3d` spells, exact
+case) or one ending `_3dprocessing` (the pre-2026-09-08 name, either
+case). On 2026-09-14 an old Voyager 1 project on Archive9
+(`/volume2/Archive9_10TB/TCRMP_2025_PBL/TCRMP_2025_PBL_01/processing/frames/<id>/`)
+made the dry run report 22 second recordings and would have moved 22 rows
+of 2025 spring onto frame folders: a copy inside `frames/` parses like its
+original and its volume sorts first. The same two layers apply: the `find`
+prunes those directories on the NAS (one `-type d` group of name terms
+beside the Synology prune), and `catalog()` drops anything still listed
+under one, counted as `inside processing folders, dropped after listing`.
+A `--root` inside one is never listed: it appears in the needs-attention
+review as `root is inside a processing folder, which the catalog never
+reads`, naming the folder. A regular file named `frames` is not a folder
+and stays a name that does not match.
+
+For each root it walks recursively (nested folders are expected
 weirdness, not an error), it parses filenames with the same shared rule
 ingest uses (`naming3d.parse_video_name`), then groups and classifies the
-files within one directory itself (`_group_members`, `_classify_group`,
-below): a part set whose files sit under two different directories is
-ambiguous and is never merged by guess. The part-set grouping mirrors
-`prep_tools`'s own rule (both spellings in `atlasprep.md`: a bare numeric
-suffix and a literal `part` word) so a local merge and a remote catalog
-group parts the same way, but the rule now lives in `atlascatalog.py`
-itself rather than being called from `prep_tools.py`, because an override
-or a name variant can change a file's identity before grouping and
-`prep_tools.py` (the local, on-disk prep step) must not change to support
-that.
+files itself (`_group_members`, `_classify_group`, below). A part set
+whose files sit in more than one folder is one recording when it is
+complete across those folders (every file part-numbered, the numbers
+exactly 1 to N with no repeat, no whole file and no proxy among them) and
+the folders are one folder and the folders inside it; any other shape
+that spans folders is never merged by guess. The rule and its accepted
+downside are under Classifying, below. The part-set grouping mirrors
+`prep_tools`'s own rule (the spellings in `atlasprep.md`: a bare numeric
+suffix, a literal `part` word and the short `pt` word) so a local merge and a remote catalog
+group parts the same way, but the rule lives in `atlascatalog.py` itself
+rather than being called from `prep_tools.py`, because an override, a name
+variant or a ruling can change a file's identity before grouping; prep
+applies the same name variants (`--name-variant`) and rulings (`--rulings`)
+on the Workbench so both sides reach the same identity.
 
 Each row records: the identity cells (`site`, `transect`, `year`,
 `season_token`) from the parsed name, `original_videos` (every source file
@@ -132,11 +171,17 @@ becomes part of a row and never triggers a needs-attention entry, even when
 its name shares a stem with a real video sitting next to it.
 
 CLI: `python3 atlascatalog.py [--nas-config <path>] [--root <NAS season
-root>]... [--overrides <path>] [--name-variant demo|3ddemo]... [--dry-run]`.
+root>]... [--overrides <path>] [--rulings <path> | --no-rulings]
+[--name-variant demo|3ddemo]... [--dry-run]`.
 With no `--root`, the season roots come from `--nas-config`'s `source_roots`
-(default: the carousel's `driver/github_repo/config/nas.yaml`). `--dry-run`
-computes and prints everything without writing to the registry or the
-needs-attention report's underlying data.
+(default: the carousel's `driver/github_repo/config/nas.yaml`, whose
+`defaults.shelf_root` and `merged_root` are the paths never walked; the run
+prints them as `never walked:` before listing anything, then `never read
+inside: processing folders` and which rulings file it read). `--rulings
+<path>` reads the rulings from another file than `catalog_rulings.csv`
+beside the registry; `--no-rulings` ignores them (every ruled file is then
+read by its name alone). `--dry-run` computes and prints everything without
+writing to the registry or the needs-attention report's underlying data.
 
 ### Site overrides
 
@@ -148,7 +193,62 @@ same site under different survey names can become two distinct rows: the
 through six lines in that file. A site label must be letters and digits, a
 blank file name or a name listed twice is refused (the message names both
 lines), and an override naming a file the catalog never saw is reported as a
-needs-attention line rather than silently ignored.
+needs-attention line rather than silently ignored. An override on a file
+that also has a ruling (below) is reported and not applied: the ruling
+places the file.
+
+### Rulings: the files the catalog cannot place
+
+`catalog_rulings.csv` sits beside the registry (`registry.RULINGS_CSV`;
+columns `nas_path, file_name, ruling, site_label, transect, date, part,
+note, ruled_by, ruled_at`, one line per NAS path, written by the ATLAS
+through `registry.set_ruling` and read by the catalog through
+`load_rulings`). It holds Lauren's decisions on the files no name rule can
+read: 26 of them on 2026-09-14. The catalog applies them on every run,
+matching each listed file by host and path:
+
+- `leave_out`: the file is dropped before parsing, counted as `files ruled
+  out`, and never becomes a needs-attention line (the five lobster, boat
+  and overhead clips, two raw camera files, a 17 s fragment and a 6.3 GB
+  false start).
+- `catalog_as`: the file is parsed as if it were named
+  `TCRMP{date}_3D_{site_label}_{transect}[_{part}].{ext}`, so it groups,
+  resolves and becomes a row, or a part of one, exactly like a well-named
+  file: `TCRMP20241112_3D_CST_T5OFAV_Proxy.MOV` ruled `CST T5 20241112`
+  is the row `CST_T5_2024ann`; `TCRMP20241113_3D_JKB_T2_2_Proxy.MOV`
+  ruled `JKB T2 20241113` is `JKB_T2_2024ann` beside its `leave_out`
+  false start; the three `GKT_EXTRA_T1` files ruled parts 1, 2, 3 are one
+  row with three parts; the six Castle T5 files of 2024-03-11 (archive
+  `_1` to `_4`, `_6`, `_7`) ruled parts 1 to 6 are `CSTSORT_T5_2024_pbl`
+  with six parts in ruled order, part 5 of the archive being missing. The
+  row's `original_videos` keeps the real file names (the Carousel pulls
+  by them), each sidecar line keeps the real name and `nas_path`, its
+  `part` is the ruling's, its `proxy` says whether the real name carries
+  the suffix, and its `edit_note` opens with `catalogued by ruling of LO
+  2026-09-14 16:26 AST: <note>`. A site label such as `CSTSORT`,
+  `SPHSORT` or `CRBLIT` names a separate project, "to sort", exactly as
+  the `LBHLBPFIX` labels did: its readable id follows the same rule
+  (`CRBLIT_T3_2024ann` beside `CRBUNLIT_T3_2024ann`) and its processing
+  folder is `{LABEL}_{T#}_3D`. A ruled file's real name is never parsed,
+  so a `demo` token or a `?` in it never matters and no name variant is
+  needed for it.
+
+A ruling whose file no listed root contained is reported once, under the
+first walked root that covers its path, as `ruled file not found; the
+ruling names a file the listing does not contain`; a ruling under a root
+this run did not walk (another season, a drive that would not mount) is
+not reported, because the run learnt nothing about it. A line of the file
+that cannot be read (a label with a slash, a date that is not a date, a
+wrong header, a path ruled twice, the wrong number of fields) is skipped,
+printed as one plain sentence before anything is listed (`skipped ruling
+line 3 of <path>: site_label must be letters and digits only, got
+'CST/T5'`) and reported as a needs-attention line under
+`catalog_rulings.csv`; the other lines apply. The run's counts print
+`rulings applied: N; files ruled out: M`.
+
+The same rulings reach the Workbench: `prep_tools.py` takes `--rulings
+<path>` from the Carousel's ingest step, so a ruled file that arrives under
+its real odd name is grouped, merged and renamed by its ruling there too.
 
 ### Name variants: seasons whose files never carried the `_3D_` token
 
@@ -164,9 +264,46 @@ names and go to needs attention instead.
 
 ### Classifying what one identity groups to
 
-Within one directory, every file that parses to the same project, date, site
-and transect is one group; a part set split across two directories is never
-merged by guess and goes to needs attention naming both. Per group:
+Every file that parses to the same project, date, site and transect is one
+group. A group whose files sit in more than one folder is one recording
+when two things hold together (Lauren, 2026-09-14, "fix the read so it can
+merge across folders"; no set on the archive had this shape that day, the
+Fish Bay 2024-02-16 case that prompted it turned out to be two versions of
+each recording, ruled on by hand): taken together the files are a complete
+part set (every one part-numbered, the numbers exactly 1 to N with no
+repeat, no whole file and no proxy among them), and the folders are one
+folder and the folders inside it (the folder of the shallowest part holds
+or contains every other part). The second condition keeps the join inside
+one season folder however the catalog was run: the default run walks
+whole volumes (`source_roots` names `/volume2/Archive9_10TB`, not a season
+folder), and a `_1` in `encoded/TCRMP_2024_PBL` beside a `_2` in
+`backup/TCRMP_2024_PBL_old` on that volume is refused, as are two sibling
+subfolders with no part in the folder above them. Such a row's
+`video_location` is the folder of part 1, `original_videos` lists the
+parts in number order, each sidecar line's `nas_path` is the file's own
+folder, and every sidecar line of the row says `parts in K folders:
+<folders>`, the folders in part order and each spelled from the top
+folder's own name (`parts in 2 folders: TCRMP_2024_PBL;
+TCRMP_2024_PBL/TCRMP2024_postbl_3D_DemoVideos`), the same words whether a
+volume or the season folder itself was walked, so the ATLAS shows that the
+parts were gathered from more than one place. The Carousel copies each
+part from its own `nas_path` into one Workbench season folder, so prep
+joins them exactly as it joins a set from one folder. Any other group that
+spans folders (a whole file or a proxy among the files, a gap, a repeat,
+folders that are not nested that way) is never merged by guess and goes to
+needs attention naming every folder ("part set split across directories;
+resolve by hand"); when the numbers were complete and only the folders
+failed, the detail says so ("complete as a part set, but the folders are
+not one folder and the folders inside it").
+
+The accepted downside, decided with the rule: two takes of one timepoint
+filed in one season folder and a folder inside it whose part numbers
+happen to complete each other (a `_1` in the season folder and a `_2` in
+its subfolder that are really two recordings) are joined as one recording.
+The folders note on every sidecar line is what makes such a join visible,
+the sidecar keeps each part's Archive path, and `prep_log.csv` lists every
+part a merge joined, so the join can be found and undone by hand. Per
+group within one folder:
 
 - parts plus any whole file is a canonical conflict (needs attention: "resolve by hand");
 - one whole, non-proxy file plus one or more `_Proxy` mirrors is the row alone,
@@ -174,6 +311,14 @@ merged by guess and goes to needs attention naming both. Per group:
   ("proxy mirror beside its full file; resolve by hand");
 - two or more whole files with no proxy or part relationship is "more than one
   whole file for one timepoint; resolve by hand";
+- two or more parts whose numbers do not run 1 to N (a gap or a repeat) is
+  "part numbers do not run 1 to N for one timepoint; the recording is not
+  whole here, resolve by hand";
+- a lone part, one part-numbered file with nothing else of its recording
+  beside it, is the whole recording (Lauren, 2026-09-11): it becomes the row
+  whatever its number, and its sidecar line keeps the number in `part` and
+  says "lone part N; taken as the whole recording, prep renames it at pull
+  time";
 - anything else (a clean single file, or a part set in one directory) becomes
   the row with every member.
 
@@ -188,28 +333,36 @@ overwriting the row silently.
 Every file behind a row, in or out of it, gets one line in
 `source_files.csv` (`readable_id, file_name, nas_path, size_bytes,
 filmed_on, container, part, proxy, in_row, edit_note, recorded_at,
-recorded_by`): `nas_path` is `<host>:<absolute dir>/<file name>`, `container`
-the lowercase extension, `filmed_on` the date parsed from the name, and
-`edit_note` the sentences above joined in one fixed order (site override,
-second recording, proxy mirror, parts, proxy, demo token). The atlas reads
+recorded_by`): `nas_path` is `<host>:<the file's own absolute dir>/<file
+name>` (a part set that spans folders has each line on its own folder, not
+the row's), `container` the lowercase extension, `filmed_on` the date parsed
+from the name, and `edit_note` the sentences above joined in one fixed order
+(the ruling sentence, site override, second recording, proxy mirror, parts
+or lone part, the folders of a set that spans folders, proxy, demo token).
+The atlas reads
 this sidecar for the row's Source videos table in the detail row (below);
 `in_row=false` lines still show there, dimmed, so an operator can see what
 the catalog set aside without opening a shell.
 
 ### Reviewing what the catalog could not place
 
-Anything left out of a row -- an unparsed name, a canonical conflict, a
-proxy mirror, a second recording, an override naming a file never seen, or a
-season root that will not mount -- is printed at the end of every run and,
-on a real run, written whole to `catalog_needs_attention.csv`
-(`root, path, reason, detail`) beside the registry. The atlas header strip's
-"need attention" tally is this file's line count, so the number an operator
-sees on `/atlas` is a direct read of the same file the catalog just wrote.
-Fixing an entry (adding an override, renaming a file, moving a stray part
-into its set's directory) and rerunning the catalog is the whole review
-loop: the catalog is idempotent, so a rerun against an unchanged Archive
-writes nothing new, and a fixed entry simply stops appearing in the next
-report.
+Anything left out of a row (an unparsed name, a canonical conflict, a
+proxy mirror, a second recording, an override naming a file never seen, an
+override on a ruled file, a ruling naming a file never seen, a ruling line
+that could not be read, a root inside a processing folder, or a season root
+that will not mount) is printed at the end of every run and, on a real run,
+written to `catalog_needs_attention.csv` (`root, path, reason, detail`)
+beside the registry: the lines of every root this run walked are replaced,
+the lines of a root it did not walk are kept, and the lines under
+`catalog_overrides.csv` and `catalog_rulings.csv` are replaced on every run
+because every run re-evaluates every override and every ruling. The atlas
+header strip's "need attention" tally is this file's line count, so the
+number an operator sees on `/atlas` is a direct read of the same file the
+catalog just wrote. Fixing an entry (ruling on the file in the ATLAS,
+adding an override, renaming a file, moving a stray part into its set's
+directory) and rerunning the catalog is the whole review loop: the catalog
+is idempotent, so a rerun against an unchanged Archive writes nothing new,
+and a fixed entry simply stops appearing in the next report.
 
 The catalog's rows are deliberately incomplete: no duration, no
 container/codec, and a `video_location` that can go stale. The full ingest
