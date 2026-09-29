@@ -57,7 +57,7 @@ duplicate timepoint.
   folders on one Archive volume, are never joined even when their numbers
   complete each other: the catalog's default run walks whole volumes, and
   the nesting rule is what keeps a join inside one season folder. The
-  Carousel copies each part from its own folder into one Workbench season
+  driver copies each part from its own folder into one Workbench season
   folder, so by the time `prep_tools.py` sees them they sit together and
   are merged exactly as a set from one folder is, and the `prep_log.csv`
   merge row lists every part it joined. The accepted downside: two takes
@@ -111,7 +111,7 @@ files arrive on the Workbench under their real names:
   `ruled out (left untouched)`.
 - A ruling applies to a file only when the file name matches and the last
   segment of the ruling's NAS folder equals the season folder's own name
-  (`TCRMP_2024_PBL`, `TCRMP_2024Annual_03`). That is how the Carousel names
+  (`TCRMP_2024_PBL`, `TCRMP_2024Annual_03`). That is how the driver names
   a staged season on the Workbench, so a hand-made folder must be named the
   same way for rulings to apply. A ruling whose file is not in the folder is
   simply unused.
@@ -126,9 +126,9 @@ files arrive on the Workbench under their real names:
   one plain line naming the file and the line). Without `--rulings` no
   ruling is applied and the tool behaves exactly as before.
 
-The Carousel's ingest stage passes `--rulings` with the registry's own file
-on every run. The running Carousel loaded that stage's code when it started,
-so a change to it takes effect at the next Carousel restart, at a batch
+The driver's ingest stage passes `--rulings` with the registry's own file
+on every run. The running driver loaded that stage's code when it started,
+so a change to it takes effect at the next driver restart, at a batch
 boundary; the rulings file itself is read fresh by every run.
 
 ## The procedure
