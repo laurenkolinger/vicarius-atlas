@@ -46,11 +46,18 @@ so a hand correction survives however many times ingest or a module reruns.
   pinned to the left regardless of which groups are collapsed. Long values
   truncate with a click-to-view popover; status cells are colored and a
   running row's stage cell pulses.
-- **Matrix** - one row per site and transect, one column per timepoint
-  (year + season token, `_pbl` before `ann`), each cell showing the step
-  status, the scale flag, and the processing folder size, so a survey gap
-  shows as an empty cell at a glance. A header row above the grid carries
-  the Start manual edit button and its sidecar (see below).
+- **Matrix** - one row per site and transect, one column per timepoint,
+  headed by the year and the season name (2024 PBL before 2024 Annual, in
+  survey order; the season code leads the column tooltip). Each cell shows
+  one word coloured by the tool that owns the step right now (Voyager 1
+  green, manual edit pink, Voyager 2 blue, VIGIL and VANGUARD orange,
+  review and failure red), with a cloud glyph when the timepoint's copy is
+  on the Shelf and an arrow beside it while a transfer runs; an empty cell
+  (no survey for that timepoint) reads NA. Once at least one transect is
+  ready, a last column headed Voyager 2 carries one Open button per ready
+  row. A header row above the grid carries the legend, a collapsed
+  Advanced fold, and the Start manual edit button and its sidecar (see
+  below).
 - **Control panel** - the restricted settings pane: an admin decides
   reviewed transects and starts uploads here, behind the platform admin PIN
   (see From the UI, under How to run it, below). It replaces the board with
@@ -59,7 +66,9 @@ so a hand correction survives however many times ingest or a module reruns.
 Beside the three tabs, a Monitors dock at the edge of the page holds the
 Voyager progress panels and the driver lanes (see The Now strip, below); it
 is not one of the three tabs, since it can stay open, docked left, right, or
-popped out into its own window, while any tab is showing.
+popped out into its own window, while any tab is showing. Pop out (and the
+console tail's own pop out) is a 28 px pop-out icon button; there is no Hide
+and no reopen tab, so the dock stays open until a person docks it elsewhere.
 
 A header strip carries the tallies, "need attention" first, then timepoints,
 step 1 done/running/not started/failed, awaiting edit, manual scale, active
@@ -607,18 +616,24 @@ table shows those as read-only text.
   one lifecycle writer
   ([`_METADATA/3d/docs/adr/0009-manual-edit-done-means-uploaded-and-verified.md`](../../../_METADATA/3d/docs/adr/0009-manual-edit-done-means-uploaded-and-verified.md)),
   not through an atlas route. The status carries six values: blank (step 1
-  has not completed), `awaiting` (waiting for a manual edit), `editing` (on
-  the edit bench), `review` (the checks ran and an admin decides), `upload`
-  (marked for upload), and `done` (uploaded to the Shelf and strictly
-  verified). The Start manual edit module writes every move: it calls the
-  library directly to pull a row onto the edit bench (`awaiting` to
-  `editing`), to carry it through `review` and `upload` as the checks run
-  and the upload is confirmed, and finally to `done` once the Shelf copy
-  passes strict verification, with `manual_edit_done` set to the local AST
-  time that verify passed; a cancelled job before Confirm returns a row from
-  `editing` to `awaiting`. Actor `manual_edit:<initials>` on every move. The
-  earlier `POST /atlas/api/mark` route this writer replaced is gone; nothing
-  in this module answers that address.
+  has not completed; the matrix reads not started, or v1 queued once a
+  Voyager 1 batch has claimed the row), `awaiting` (waiting for a manual
+  edit; the matrix reads v1 done), `editing` (on the edit bench; the matrix
+  reads edit), `review` (the checks ran and an admin decides; the matrix
+  reads edit review), `upload` (marked for upload; the matrix reads edit
+  done), and `done` (uploaded to the Shelf and strictly verified; the
+  matrix reads edit done with a cloud). The Start manual edit module writes
+  every move: it calls the library directly to pull a row onto the edit
+  bench (`awaiting` to `editing`), to carry it through `review` and
+  `upload` as the checks run and the upload is confirmed, and finally to
+  `done` once the Shelf copy passes strict verification, with
+  `manual_edit_done` set to the local AST time that verify passed; a
+  cancelled job before Confirm returns a row from `editing` to `awaiting`.
+  Actor `manual_edit:<initials>` on every move. The earlier
+  `POST /atlas/api/mark` route this writer replaced is gone; nothing in
+  this module answers that address. The matrix word for each value is set
+  out in [`docs/superpowers/specs/2026-10-05-atlas-notation-design.md`](/mnt/rip/vicarius_drive/docs/superpowers/specs/2026-10-05-atlas-notation-design.md);
+  the registry values above never changed.
 
 ### The Now strip
 
@@ -659,13 +674,17 @@ lanes above show the same batches through `GET /atlas/api/progress`.
 
 ### Focus and columns follow the step
 
-A Focus select in the toolbar dims every row (and matrix cell) outside the
-chosen set without hiding it, so a filtered row stays reachable and
-editable: **All rows**, **Active** (rows in flight plus rows in the manual
-edit job), **Manual edit** (rows in the job), **Needs attention** (rows
-interrupted, failed, or awaiting an edit). A "Columns follow the step"
-toggle, remembered per browser, expands the column group of whatever stage
-is active right now and collapses the others (step 1 stages to the step 1
+Focus, Hidden rows, Columns follow the step, the refresh button, Column
+groups and Columns now sit under one collapsed **Advanced** fold beneath
+the legend, closed by default and remembered open or closed per browser.
+
+A Focus select dims every row (and matrix cell) outside the chosen set
+without hiding it, so a filtered row stays reachable and editable: **All
+rows**, **Active** (rows in flight plus rows in the manual edit job),
+**Manual edit** (rows in the job), **Needs attention** (rows interrupted,
+failed, or awaiting an edit). A "Columns follow the step" toggle,
+remembered per browser, expands the column group of whatever stage is
+active right now and collapses the others (step 1 stages to the step 1
 group, awaiting and editing to the manual group, step 2 stages to the step
 2 group); clicking a group chip while it is on turns it off so a manual
 choice always wins.
@@ -684,10 +703,10 @@ already gone.
 A row with `scale_status = MANUAL_NEEDED` carries its own badge in the table
 (purple) that jumps straight to the scale numbers in the detail drawer, since
 a mean scale error over threshold needs a person's judgment, not a rerun.
-A row on the edit bench inside a manual edit job carries an "on edit bench"
-chip and is greyed in the table (an outline in the matrix): Voyager 1 and
-Voyager 2 leave it alone until the job is certified and pushed back to the
-Shelf.
+A row on the edit bench inside a manual edit job carries an "edit" chip,
+the table's own version of the matrix's pink edit word, and is greyed in
+the table (an outline in the matrix): Voyager 1 and Voyager 2 leave it
+alone until the job is certified and pushed back to the Shelf.
 
 ### Detail row
 
@@ -720,22 +739,26 @@ folder the way the id-click detail drawer below is.
 
 ### Matrix and Start manual edit
 
-The matrix view's header row carries the status legend at the left and a
-**Start manual edit** button at the right. It enables once at least one row
-has `step1_status` complete, `manual_edit_status` awaiting, and no manual
-edit job is already running; with a job running it instead reads "Manual
-edit in progress" and opens the same panel. Either way the button opens a
-sidecar beside the grid (below it at narrow widths) that mounts the Start
-manual edit module's own fragment (`GET /manual-edit/fragment`), so bringing
-transects down to the edit bench, walking the Metashape checklist, running
-the checks and certifying a job all happen without leaving the atlas; see
-[the manual_edit module's README](/mnt/rip/vicarius_drive/vicarius/modules/manual_edit/github_repo/README.md)
+The matrix view's header row carries the status legend (ordered from not
+started to settled, then the issues, then the cloud and arrow glyphs) at
+the left and a **Start manual edit** button at the right. It enables once
+at least one row has `step1_status` complete, `manual_edit_status`
+awaiting, and no manual edit job is already running; with a job running it
+instead reads **Open manual edit**, and either wording opens the same
+sidecar. The sidecar beside the grid (below it at narrow widths) is titled
+**Manual edit** and holds two sections: **Current projects**, one card per
+project in progress (left out when there is none), and **New project**,
+the row picker and the two steps that start one. The panel mounts the
+Start manual edit module's own fragment (`GET /manual-edit/fragment`), so
+bringing transects down to the edit bench, walking the Metashape checklist,
+running the checks and certifying a job all happen without leaving the
+atlas; see [the manual_edit module's README](/mnt/rip/vicarius_drive/vicarius/modules/manual_edit/github_repo/README.md)
 for what a student does inside it. A cell whose row is on the edit bench
-carries a dashed outline in the matrix, matching the table's "on edit
-bench" chip. The matrix header and the season token cells also carry the
-season's camera model and preprocessing as a tooltip, and the id cell shows
-a small `#N` order chip once `processing_order.csv` holds a position for
-that row (order is edited only in Voyager tools).
+carries a dashed outline in the matrix, matching the table's "edit" chip.
+The matrix header and the season token cells also carry the season's
+camera model and preprocessing as a tooltip, and the id cell shows a small
+`#N` order chip once `processing_order.csv` holds a position for that row
+(order is edited only in Voyager tools).
 
 The same matrix renders in a selection mode for other pages:
 `window.Atlas.mountMatrix(el, {selectable, eligible, onSelect, rows})`
